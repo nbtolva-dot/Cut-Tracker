@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Cut tracker</title>
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Cut">
+  <meta name="theme-color" content="#E8EDEB" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0F1815" media="(prefers-color-scheme: dark)">
+  <link rel="apple-touch-icon" href="icon-180.png">
+  <link rel="icon" type="image/png" href="icon-192.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <style>
+    html, body { margin: 0; background: #E8EDEB; }
+    @media (prefers-color-scheme: dark) { html, body { background: #0F1815; } #boot { color: #8FA19A; } }
+    #boot { font-family: -apple-system, system-ui, sans-serif; color: #5A6A65; max-width: 560px; margin: 0 auto;
+            padding: calc(48px + env(safe-area-inset-top)) 18px 0; font-size: 16px; line-height: 1.45; }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "react": "https://esm.sh/react@18.3.1",
+      "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+      "recharts": "https://esm.sh/recharts@2.12.7?deps=react@18.3.1,react-dom@18.3.1"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="root"><p id="boot">Loading…</p></div>
+  <script>
+    // If the app hasn't started after 12 seconds, say so instead of sitting on "Loading".
+    setTimeout(function () {
+      if (!window.__cutTrackerLoaded) {
+        var b = document.getElementById("boot");
+        if (b) b.textContent = "The app didn't start. Check your connection and reopen it. If it keeps happening, the chart and React libraries from esm.sh may be unreachable.";
+      }
+    }, 12000);
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", function () { navigator.serviceWorker.register("sw.js").catch(function () {}); });
+    }
+  </script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
