@@ -1,5 +1,5 @@
 // Lets the app open instantly and work offline after the first load.
-const CACHE = "cut-tracker-v3";
+const CACHE = "cut-tracker-v4";
 
 self.addEventListener("install", () => self.skipWaiting());
 

@@ -1,4 +1,4 @@
-// Cut tracker v3. Built from app.jsx.
+// Cut tracker v4. Built from app.jsx.
 import React, { useState, useEffect, useMemo } from "react";
 import { createRoot } from "react-dom/client";
 import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceArea, ReferenceLine, ResponsiveContainer, } from "recharts";
@@ -25,6 +25,9 @@ const MODEL = {
     calibMinWatch: 24, // watch days needed inside that window
     watchCap: 150, // most the watch can move maintenance
     watchFlag: 0.10, // activity change that gets called out
+    strengthDrop: -0.04, // main lifts down this much over three weeks...
+    strengthRate: 1.3, // ...while losing at least this fast (lb/week)...
+    strengthAdd: 150, // ...adds this to maintenance until strength recovers
 };
 const DAILY_GAIN = 1 - Math.pow(1 - MODEL.weeklyGain, 1 / 7);
 const DEFAULTS = {
@@ -32,7 +35,7 @@ const DEFAULTS = {
     goalRate: 1.25, minRate: 1.0, maxRate: 1.5,
     goalLow: 180, goalHigh: 185, cutStart: "2026-10-12",
     sleepHours: 7.5, calorieFloor: 2000, proteinLow: 180, proteinHigh: 200,
-    targetMode: "daily", bottleOz: 24,
+    targetMode: "daily", bottleOz: 24, strengthGuard: true,
 };
 // Local storage on this device.
 const storage = {
@@ -94,6 +97,8 @@ function migrate(d, today) {
             out.entries[k] = n;
     }
     delete out.settings.shortcutName;
+    if (d.lift && d.lift.program && Array.isArray(d.lift.sessions))
+        out.lift = d.lift;
     if ((d.version || 1) < 2) {
         out.settings.targetMode = DEFAULTS.targetMode;
         // keep a record of what v1 actually told you to eat, for the history table
@@ -288,7 +293,7 @@ function calibrationDate(w, s, today) {
     return maxKey(maxKey(a, b), today);
 }
 // Replays every day from the cut start. Same inputs always give the same numbers.
-function runModel(data, today) {
+function runModel(data, today, liftRun) {
     const s = data.settings, E = data.entries;
     const days = [];
     if (!isKey(s.cutStart) || s.cutStart > today)
@@ -327,7 +332,15 @@ function runModel(data, today) {
         row.est = est;
         row.watch = watchModel(E, k, s, row.meas);
         row.shift = row.watch.active ? row.watch.shift : 0;
-        row.maint = est + row.shift;
+        row.strengthShift = 0;
+        if (liftRun && s.strengthGuard !== false) {
+            row.strength = strengthChange(liftRun, k);
+            const tr = trend14(E, k);
+            row.lossRate = tr ? tr.rateWk : null;
+            if (row.strength && row.strength.n >= 3 && isNum(row.strength.change) && row.strength.change <= MODEL.strengthDrop && isNum(row.lossRate) && row.lossRate >= MODEL.strengthRate)
+                row.strengthShift = MODEL.strengthAdd;
+        }
+        row.maint = est + row.shift + row.strengthShift;
         row.raw = Math.max(s.calorieFloor, round50(row.maint - (s.goalRate * KCAL_PER_LB) / 7));
         if (s.targetMode === "weekly") {
             const ws = weekStart(k);
@@ -347,9 +360,9 @@ function runModel(data, today) {
     }
     return days;
 }
-function derive(data, today) {
+function derive(data, today, liftRun) {
     const s = data.settings, E = data.entries;
-    const rows = runModel(data, today);
+    const rows = runModel(data, today, liftRun);
     const byKey = {};
     rows.forEach((r) => { byKey[r.k] = r; });
     const pts = weightPts(E, today);
@@ -492,6 +505,372 @@ async function shareFile(filename, text, mime) {
     catch (e) {
         return "failed";
     }
+}
+/* ---------- lift engine ---------- */
+// Every number below is a rule Nate signed off on. Change them here and nowhere else.
+const LIFT = {
+    fuelGrace: 150, // a session counts if pre-workout fuel is within this of the day's floor
+    hot: 9, // any work set (not the last) at 9+ is too hot
+    cutDrop: 8.5, // right after a bump, every set at 8.5+ means go back down
+    graze: 7.5, // a flat 7.5 with no pushed last set is a graze, never a bump
+    clean: 7, // every set at 7 or below with full reps is a bump
+    pushLo: 8, pushHi: 9, // a pushed last set lands here
+    beatBy: 2, // last set beating the rep target by this much is a bump
+    secCatch: 7.5, // a secondary catches up after its main lift moves, if it read this or lower
+    secLow: 6.5, // a secondary reading this or lower twice in a row moves on its own
+};
+const MAIN_LIFTS = ["bench@main", "ohp@main", "squat@main", "rdl@main", "row@main", "pullup@main", "pulldown@main"];
+const RPE_CHOICES = [6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10];
+const exOf = (key) => key.split("@")[0];
+const workSets = (sets) => (sets || []).filter((s) => !s.warm && (isNum(s.reps) || isNum(s.rpe)));
+const fmtW = (w, bw) => (w == null ? "–" : bw ? (w === 0 ? "BW" : `BW${w > 0 ? "+" : "−"}${Math.abs(w)}`) : (Math.round(w * 10) / 10).toString());
+const repsText = (t) => (t.lo === t.hi ? `${t.lo}` : `${t.lo}–${t.hi}`);
+function exMeta(program, ex) {
+    return (program.exercises && program.exercises[ex]) || { name: ex.replace(/_/g, " "), equip: "machine", step: 5 };
+}
+function keyFor(program, dayId, ex) {
+    const d = program.days[dayId];
+    const s = d && d.slots.find((x) => x.ex === ex);
+    return s ? s.key : ex;
+}
+function slotFor(program, key, dayId) {
+    const d = program.days[dayId];
+    let s = d && d.slots.find((x) => x.key === key);
+    if (!s)
+        for (const dd of Object.values(program.days)) {
+            s = dd.slots.find((x) => x.key === key);
+            if (s)
+                break;
+        }
+    return s || null;
+}
+function daysWithKey(program, key) {
+    return Object.entries(program.days).filter(([, d]) => d.slots.some((s) => s.key === key)).map(([id]) => id);
+}
+function readValidity(session, meta, read, program) {
+    if (read.mismatch)
+        return "different equipment";
+    if (session.deload)
+        return "deload week";
+    if (read.pain)
+        return "pain flagged";
+    if (session.venue === "away" && (meta.equip === "machine" || meta.equip === "cable"))
+        return "machine away from home";
+    const floor = program.days[session.dayId] && program.days[session.dayId].floor;
+    if (isNum(session.fuel) && isNum(floor) && session.fuel < floor - LIFT.fuelGrace)
+        return "under-fueled";
+    if (read.unknownCount)
+        return "set count not logged";
+    return null;
+}
+// One lift, one session, against the rules. Pure function.
+function judge(read, target, presc, role, st, mainW, step) {
+    const ws = workSets(read.sets);
+    if (!ws.length)
+        return { status: "none" };
+    const rpes = ws.map((s) => s.rpe);
+    if (rpes.some((r) => !isNum(r)))
+        return { status: "noRPE" };
+    const eps = 1e-9;
+    const lighter = ws.filter((s) => isNum(s.w) && s.w < presc - eps);
+    if (lighter.length) {
+        const first = ws[0];
+        if (isNum(first.w) && first.w >= presc - eps && first.rpe >= LIFT.hot) {
+            return { status: "dropback", next: Math.max(...lighter.map((s) => s.w)), why: "first set at 9 or higher" };
+        }
+        return { status: "lighter" };
+    }
+    const missed = ws.length < target.sets || ws.some((s) => !isNum(s.reps) || s.reps < target.lo);
+    if (missed)
+        return { status: "missed" };
+    const nonFinal = rpes.slice(0, -1), final = rpes[rpes.length - 1], last = ws[ws.length - 1];
+    if (nonFinal.some((r) => r >= LIFT.hot)) {
+        return st.fresh && isNum(st.prevW) ? { status: "dropback", next: st.prevW, why: "too hot right after a bump" } : { status: "hot" };
+    }
+    if (st.fresh && isNum(st.prevW) && rpes.every((r) => r >= LIFT.cutDrop)) {
+        return { status: "dropback", next: st.prevW, why: "every set at 8.5 or higher right after a bump" };
+    }
+    const fullTop = ws.every((s) => s.reps >= target.hi);
+    const allAtMost = (x) => rpes.every((r) => r <= x);
+    if (ws.every((s) => isNum(s.w) && s.w > presc + eps)) {
+        return fullTop && allAtMost(LIFT.graze) ? { status: "selfjump", next: ws[0].w } : { status: "selfjumpRejected" };
+    }
+    if (role === "secondary") {
+        if (fullTop && allAtMost(LIFT.secCatch) && isNum(mainW) && isNum(st.anchorAtChange) && mainW > st.anchorAtChange + eps) {
+            return { status: "catchup", next: presc + step, why: "its main lift moved up" };
+        }
+        if (fullTop && allAtMost(LIFT.secLow)) {
+            return st.lowStreak >= 1 ? { status: "catchup", next: presc + step, why: "6.5 or lower twice in a row" } : { status: "lowOnce" };
+        }
+        return { status: "hold" };
+    }
+    const a = fullTop && allAtMost(LIFT.clean);
+    const b = fullTop && nonFinal.every((r) => r <= LIFT.graze) && final >= LIFT.pushLo && final <= LIFT.pushHi;
+    const c = isNum(last.reps) && last.reps >= target.hi + LIFT.beatBy;
+    if (a || b || c)
+        return { status: "pass", why: a ? "every set at 7 or lower" : b ? "work sets 7.5 or lower, last set pushed" : `last set beat the target by ${LIFT.beatBy}+` };
+    if (!fullTop)
+        return { status: "reps" };
+    if (allAtMost(LIFT.graze))
+        return { status: "graze" };
+    return { status: "hold" };
+}
+function e1rmOf(ws, bwLift, bw) {
+    const v = [];
+    for (const s of ws) {
+        if (!isNum(s.reps) || !isNum(s.rpe) || !isNum(s.w))
+            continue;
+        const load = bwLift ? (isNum(bw) ? bw + s.w : null) : s.w;
+        if (!isNum(load) || load <= 0)
+            continue;
+        v.push(load * (1 + (s.reps + (10 - s.rpe)) / 30));
+    }
+    return v.length ? mean(v) : null;
+}
+function sessionOrder(a, b) {
+    if (a.date !== b.date)
+        return a.date < b.date ? -1 : 1;
+    return (a.sn || 0) - (b.sn || 0) || (a.startedAt || 0) - (b.startedAt || 0);
+}
+// Replays every session in order. Same history always gives the same prescriptions.
+function liftCtx(program, E) {
+    const ctx = { program, E: E || {}, state: {}, log: [], reads: {} };
+    return ctx;
+}
+function getSt(ctx, key) {
+    return (ctx.state[key] = ctx.state[key] || { w: null, prevW: null, fresh: false, passes: {}, lowStreak: 0, anchorAtChange: null, lastReps: null, changedAt: null, history: [] });
+}
+function mainWOf(ctx, key) {
+    return key.endsWith("@sec") && ctx.state[`${exOf(key)}@main`] ? ctx.state[`${exOf(key)}@main`].w : null;
+}
+function setWOf(ctx, key, st, w, date, fresh, reason) {
+    st.prevW = st.w;
+    st.w = w;
+    st.fresh = fresh;
+    st.changedAt = date;
+    st.passes = {};
+    st.lowStreak = 0;
+    st.lastReps = null;
+    st.anchorAtChange = mainWOf(ctx, key);
+    st.history.push({ date, w, reason });
+}
+function applySession(ctx, s) {
+    const { program } = ctx;
+    const out = [];
+    for (const read of s.exercises || []) {
+        const key = read.key || keyFor(program, s.dayId, read.ex);
+        const slot = slotFor(program, key, s.dayId) || { sets: workSets(read.sets).length || 3, lo: 1, hi: 1, role: "accessory" };
+        const meta = exMeta(program, read.ex);
+        const st = getSt(ctx, key);
+        const ws = workSets(read.sets);
+        if (s.source === "import" && !read.mismatch && !read.skipped && ws.length && isNum(ws[0].w)) {
+            if (st.w == null || Math.abs(ws[0].w - st.w) > 1e-9)
+                setWOf(ctx, key, st, ws[0].w, s.date, st.w != null && ws[0].w > st.w, "logged");
+        }
+        const presc = s.source === "import" ? st.w : (isNum(read.presc) ? read.presc : st.w);
+        const before = { w: st.w, fresh: st.fresh, prevW: st.prevW };
+        const invalid = read.skipped ? null : readValidity(s, meta, read, program);
+        let res;
+        if (read.skipped)
+            res = { status: "skipped", why: read.skipped };
+        else if (invalid)
+            res = { status: "invalid", why: invalid };
+        else if (!isNum(presc))
+            res = { status: ws.length && isNum(ws[0].w) ? "baseline" : "none" };
+        else
+            res = judge(read, slot, presc, slot.role, st, mainWOf(ctx, key), meta.step);
+        const counted = !["skipped", "invalid", "none", "lighter", "noRPE"].includes(res.status);
+        switch (res.status) {
+            case "baseline":
+                setWOf(ctx, key, st, ws[0].w, s.date, false, "baseline");
+                break;
+            case "pass": {
+                st.passes[s.dayId] = true;
+                if (Object.values(st.passes).every(Boolean)) {
+                    res.status = "bump";
+                    res.next = presc + meta.step;
+                    setWOf(ctx, key, st, res.next, s.date, true, "bump");
+                }
+                else {
+                    res.status = "waiting";
+                    res.blockedBy = Object.entries(st.passes).filter(([, v]) => !v).map(([d]) => d);
+                }
+                break;
+            }
+            case "dropback":
+                setWOf(ctx, key, st, isNum(res.next) ? res.next : presc - meta.step, s.date, false, "drop back");
+                break;
+            case "catchup":
+                setWOf(ctx, key, st, res.next, s.date, true, "catch up");
+                break;
+            case "selfjump":
+                setWOf(ctx, key, st, res.next, s.date, false, "accepted heavier weight");
+                break;
+            case "lowOnce":
+                st.lowStreak = 1;
+                st.fresh = false;
+                break;
+            case "graze":
+            case "hold":
+            case "reps":
+            case "hot":
+            case "missed":
+            case "selfjumpRejected":
+                st.passes[s.dayId] = false;
+                st.lowStreak = 0;
+                st.fresh = false;
+                break;
+            default: break;
+        }
+        if (counted && !["bump", "catchup", "dropback", "selfjump", "baseline"].includes(res.status) && isNum(st.w) && ws.length && Math.abs((ws[ws.length - 1].w ?? st.w) - st.w) < 1e-9) {
+            st.lastReps = ws.map((x) => x.reps);
+        }
+        const bw = avg7(ctx.E, s.date);
+        const e1 = counted ? e1rmOf(ws, meta.equip === "bodyweight", bw) : null;
+        const rp = ws.map((x) => x.rpe).filter(isNum);
+        const entry = { sessionId: s.id, date: s.date, dayId: s.dayId, key, ex: read.ex, res, presc, before, nextW: st.w, e1rm: e1, bw, counted, rpeAvg: rp.length ? mean(rp) : null };
+        ctx.log.push(entry);
+        out.push(entry);
+        if (isNum(e1))
+            (ctx.reads[key] = ctx.reads[key] || []).push({ date: s.date, e1rm: e1, bw });
+    }
+    return out;
+}
+function runLift(lift, E) {
+    const ctx = liftCtx(lift.program, E);
+    const events = [];
+    (lift.sessions || []).forEach((s) => events.push({ t: "s", date: s.date, s }));
+    (lift.overrides || []).forEach((o) => events.push({ t: "o", date: o.date, o }));
+    events.sort((x, y) => (x.date !== y.date ? (x.date < y.date ? -1 : 1) : x.t === y.t ? (x.t === "s" ? sessionOrder(x.s, y.s) : (x.o.at || 0) - (y.o.at || 0)) : x.t === "s" ? -1 : 1));
+    for (const ev of events) {
+        if (ev.t === "o") {
+            const st = getSt(ctx, ev.o.key);
+            setWOf(ctx, ev.o.key, st, ev.o.weight, ev.o.date, false, "set by hand");
+        }
+        else
+            applySession(ctx, ev.s);
+    }
+    return ctx;
+}
+// Runs one extra session on a copy of the current state, for live previews while logging.
+function previewSession(run, s) {
+    const ctx = { program: run.program, E: run.E, state: JSON.parse(JSON.stringify(run.state)), log: [], reads: {} };
+    return applySession(ctx, s);
+}
+// Average change in estimated 1RM across the main lifts, now versus three weeks earlier.
+function strengthChange(run, k) {
+    if (!run)
+        return null;
+    const pcts = [];
+    for (const key of MAIN_LIFTS) {
+        const arr = run.reads[key];
+        if (!arr || !arr.length)
+            continue;
+        let cur = null, base = null;
+        for (const r of arr) {
+            if (r.date <= k && r.date >= addDays(k, -10))
+                cur = r;
+            if (r.date <= addDays(k, -21) && r.date >= addDays(k, -35))
+                base = r;
+        }
+        if (cur && base)
+            pcts.push(cur.e1rm / base.e1rm - 1);
+    }
+    return pcts.length ? { change: mean(pcts), n: pcts.length } : { change: null, n: 0 };
+}
+function lastSession(lift) {
+    const s = [...(lift.sessions || [])].sort(sessionOrder);
+    return s[s.length - 1] || null;
+}
+function nextUp(lift) {
+    const cycle = lift.program.cycle;
+    const last = lastSession(lift);
+    if (!last)
+        return { dayId: cycle[0], week: 1 };
+    const i = cycle.indexOf(last.dayId);
+    if (i < 0)
+        return { dayId: cycle[0], week: (last.week || 0) + 1 };
+    const j = (i + 1) % cycle.length;
+    return { dayId: cycle[j], week: (last.week || 0) + (j <= i ? 1 : 0) };
+}
+function prefillSets(slot, st) {
+    const n = slot.sets;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+        let reps = slot.lo;
+        if (slot.hi > slot.lo && st && st.lastReps && isNum(st.lastReps[i]))
+            reps = clamp(st.lastReps[i], slot.lo, slot.hi);
+        out.push({ w: st ? st.w : null, reps, rpe: null });
+    }
+    return out;
+}
+function buildDraft(lift, run, dayId, date, week) {
+    const day = lift.program.days[dayId];
+    return {
+        id: `${date}-${dayId}-${Date.now()}`, date, dayId, week, venue: "home", fuel: null, deload: false,
+        srpe: null, duration: null, stretched: null, notes: "", startedAt: Date.now(),
+        exercises: day.slots.map((slot) => {
+            const st = run.state[slot.key];
+            return { key: slot.key, ex: slot.ex, presc: st ? st.w : null, sets: prefillSets(slot, st), skipped: null, pain: false };
+        }),
+    };
+}
+function draftToSession(d) {
+    return {
+        id: d.id, date: d.date, week: d.week, dayId: d.dayId, venue: d.venue, fuel: d.fuel, deload: d.deload,
+        srpe: d.srpe, duration: d.duration, stretched: d.stretched, notes: d.notes, source: "app", startedAt: d.startedAt,
+        exercises: d.exercises.map((x) => ({
+            key: x.key, ex: x.ex, presc: x.presc, skipped: x.skipped, pain: x.pain,
+            sets: x.sets.filter((s) => isNum(s.rpe) || isNum(s.reps)).map((s) => ({ w: s.w, reps: s.reps, rpe: s.rpe, warm: false })),
+        })),
+    };
+}
+function outcomeText(entry, program) {
+    const r = entry.res, meta = exMeta(program, entry.ex), bw = meta.equip === "bodyweight";
+    const W = (w) => fmtW(w, bw);
+    switch (r.status) {
+        case "bump": return { tone: "good", text: `Bump: ${W(r.next)} next time (${r.why}).` };
+        case "waiting": return { tone: "muted", text: `Passed here. Moves up once ${r.blockedBy.map((d) => (program.days[d] ? program.days[d].name : d)).join(" and ")} passes too.` };
+        case "graze": return { tone: "warn", text: `Graze: holds at ${W(entry.nextW)}. Push the last set to 8–9 next time.` };
+        case "missed": return { tone: "warn", text: `Missed reps or sets: holds at ${W(entry.nextW)}.` };
+        case "hot": return { tone: "warn", text: `Too hot: holds at ${W(entry.nextW)}.` };
+        case "dropback": return { tone: "warn", text: `Drop back to ${W(entry.nextW)} next time (${r.why}).` };
+        case "reps": return { tone: "muted", text: `Holds at ${W(entry.nextW)}. Add reps toward ${slotFor(program, entry.key, entry.dayId)?.hi ?? "the top"}.` };
+        case "hold": return { tone: "muted", text: `Holds at ${W(entry.nextW)}.` };
+        case "catchup": return { tone: "good", text: `Catches up to ${W(r.next)} next time (${r.why}).` };
+        case "lowOnce": return { tone: "muted", text: "Holds. One more session at 6.5 or lower moves it up." };
+        case "selfjump": return { tone: "good", text: `New working weight ${W(r.next)}. No extra bump on top.` };
+        case "selfjumpRejected": return { tone: "warn", text: `Back to the planned ${W(entry.nextW)} next time.` };
+        case "invalid": return { tone: "muted", text: `Doesn't count (${r.why}). Re-read next time.` };
+        case "lighter": return { tone: "muted", text: "Lighter than planned, so it doesn't count." };
+        case "noRPE": return { tone: "muted", text: "Give every set an RPE to get a decision." };
+        case "baseline": return { tone: "good", text: `Baseline set at ${W(entry.nextW)}.` };
+        case "skipped": return { tone: "muted", text: `Skipped (${r.why}).` };
+        default: return { tone: "muted", text: "Nothing logged." };
+    }
+}
+// Flags worth a coaching look. They never change weights.
+function liftFlags(run, key) {
+    const entries = run.log.filter((e) => e.key === key && e.counted && isNum(e.rpeAvg));
+    if (!entries.length)
+        return [];
+    const lastP = entries[entries.length - 1].presc;
+    const same = [];
+    for (let i = entries.length - 1; i >= 0; i--) {
+        if (Math.abs(entries[i].presc - lastP) < 1e-9 && !["bump", "catchup", "dropback", "selfjump"].includes(entries[i].res.status))
+            same.unshift(entries[i]);
+        else
+            break;
+    }
+    const flags = [];
+    if (same.length >= 3) {
+        const tail = same.slice(-3);
+        if (tail[2].rpeAvg - tail[0].rpeAvg >= 1)
+            flags.push({ kind: "drift", text: `RPE up ${fmt1(tail[2].rpeAvg - tail[0].rpeAvg)} at the same weight over three sessions.` });
+    }
+    if (same.length >= 4)
+        flags.push({ kind: "stall", text: `Same weight for ${same.length} sessions that counted. Normal on a cut.` });
+    return flags;
 }
 /* ---------- hooks ---------- */
 function usePrefersDark() {
@@ -712,6 +1091,20 @@ function Breakdown({ r, s, prevTarget }) {
                         ", once it has ",
                         MODEL.calibMinWatch,
                         " days in a four-week window.")),
+            r.strength && (React.createElement("li", null, isNum(r.strength.change)
+                ? React.createElement(React.Fragment, null,
+                    "Strength check: your main lifts are ",
+                    r.strength.change >= 0 ? "up" : "down",
+                    " ",
+                    fmt1(Math.abs(r.strength.change * 100)),
+                    "% over three weeks",
+                    r.strengthShift ? React.createElement(React.Fragment, null,
+                        ", while you're losing fast, so ",
+                        React.createElement("b", null,
+                            "+",
+                            r.strengthShift),
+                        " until strength recovers.") : ", so no change.")
+                : React.createElement(React.Fragment, null, "Strength check: not enough recent sessions yet, so no change."))),
             React.createElement("li", null,
                 "Maintenance ",
                 React.createElement("b", null, fmtInt(r.maint)),
@@ -865,7 +1258,7 @@ function CheckIn({ data, today, onSave, prefill, onPrefillUsed }) {
             msg && React.createElement("p", { className: msg.err ? "err" : "ok", role: "status" }, msg.t))));
 }
 /* ---------- tabs ---------- */
-function TodayTab({ data, der, today, onSave, prefill, onPrefillUsed, onRestore }) {
+function TodayTab({ data, der, today, onSave, prefill, onPrefillUsed, onRestore, liftRun, onOpenLift }) {
     const s = data.settings;
     const [open, setOpen] = useState(false);
     const r = der.row;
@@ -885,7 +1278,7 @@ function TodayTab({ data, der, today, onSave, prefill, onPrefillUsed, onRestore 
         empty && (React.createElement("section", { className: "sec" },
             React.createElement("div", { className: "panel" },
                 React.createElement("h2", null, "Start here"),
-                React.createElement("p", null, "Moving over from an earlier version? Restore your backup file first so your history comes with you."),
+                React.createElement("p", null, "Nothing here yet. If your history is in Safari or an older copy of the app, export a backup there, then restore it here."),
                 React.createElement("button", { className: "btn ghost", style: { marginTop: 12 }, onClick: onRestore }, "Restore a backup")))),
         React.createElement("section", { className: "hero" },
             React.createElement("p", { className: "hero-label" }, "Eat today"),
@@ -916,6 +1309,7 @@ function TodayTab({ data, der, today, onSave, prefill, onPrefillUsed, onRestore 
             React.createElement("h2", null, "Today's read"),
             React.createElement("p", null, buildRead(der, today)),
             status && React.createElement("p", { className: `status ${status.tone}` }, status.text)),
+        React.createElement(TrainingCard, { data: data, run: liftRun, today: today, onOpen: onOpenLift }),
         React.createElement(CheckIn, { data: data, today: today, onSave: onSave, prefill: prefill, onPrefillUsed: onPrefillUsed })));
 }
 function ChartTip({ active, payload }) {
@@ -1264,6 +1658,7 @@ function Settings({ data, onSave }) {
         }
         next.sex = f.sex === "female" ? "female" : "male";
         next.targetMode = f.targetMode === "weekly" ? "weekly" : "daily";
+        next.strengthGuard = f.strengthGuard !== "false";
         if (isKey(f.cutStart))
             next.cutStart = f.cutStart;
         if (next.goalRate > next.maxRate)
@@ -1291,6 +1686,16 @@ function Settings({ data, onSave }) {
                     MODEL.weeklyCap,
                     " at a time"))),
         React.createElement("div", { className: "row2" }, SETTING_GROUPS[0].fields.map(input)),
+        React.createElement("label", { className: "field" },
+            React.createElement("span", null, "Strength guardrail"),
+            React.createElement("select", { className: "input sm", value: String(f.strengthGuard !== "false"), onChange: (e) => setF({ ...f, strengthGuard: e.target.value }) },
+                React.createElement("option", { value: "true" },
+                    "On: add ",
+                    MODEL.strengthAdd,
+                    " if lifts drop ",
+                    Math.abs(MODEL.strengthDrop * 100),
+                    "%+ while losing fast"),
+                React.createElement("option", { value: "false" }, "Off"))),
         React.createElement("h3", null, "About you"),
         React.createElement("div", { className: "row2" },
             SETTING_GROUPS[1].fields.map(input),
@@ -1306,8 +1711,11 @@ function Settings({ data, onSave }) {
         React.createElement("button", { className: "btn", onClick: save }, "Save settings"),
         msg && React.createElement("p", { className: msg.err ? "err" : "ok", role: "status" }, msg.t)));
 }
-function SettingsSheet({ data, der, onClose, onSaveSettings, onImport }) {
+function SettingsSheet({ data, der, onClose, onSaveSettings, onImport, focus }) {
+    const dataRef = React.useRef(null);
     useEffect(() => {
+        if (focus === "data" && dataRef.current)
+            dataRef.current.scrollIntoView({ block: "start" });
         const prev = document.body.style.overflow;
         document.body.style.overflow = "hidden";
         const onKey = (e) => { if (e.key === "Escape")
@@ -1324,11 +1732,12 @@ function SettingsSheet({ data, der, onClose, onSaveSettings, onImport }) {
         React.createElement("div", { className: "sheet-body" },
             React.createElement("section", { className: "sec" },
                 React.createElement(Settings, { data: data, onSave: onSaveSettings })),
-            React.createElement("section", { className: "sec" },
+            React.createElement("section", { className: "sec", ref: dataRef },
                 React.createElement("h2", null, "Your data"),
                 React.createElement(ExportPanel, { data: data, der: der, onImport: onImport })))));
 }
 function ExportPanel({ data, der, onImport }) {
+    const current = data;
     const [out, setOut] = useState(null);
     const [inp, setInp] = useState("");
     const [msg, setMsg] = useState(null);
@@ -1352,15 +1761,24 @@ function ExportPanel({ data, der, onImport }) {
     };
     const importText = (t) => {
         try {
-            const d = migrate(JSON.parse(t), todayKey());
+            const raw = JSON.parse(t);
+            if (raw && raw.kind === "lift-import" && raw.program && Array.isArray(raw.sessions)) {
+                onImport({ ...current, lift: { program: raw.program, sessions: raw.sessions, overrides: raw.overrides || [], draft: null } });
+                setInp("");
+                setMsg({ err: false, t: `Lift history imported: ${raw.sessions.length} sessions. Your weigh-ins and calories weren't touched.` });
+                return;
+            }
+            const d = migrate(raw, todayKey());
             if (!d)
                 throw new Error("bad");
+            if (!d.lift && current.lift)
+                d.lift = current.lift;
             onImport(d);
             setInp("");
-            setMsg({ err: false, t: `Backup restored with ${Object.keys(d.entries).length} days of data.` });
+            setMsg({ err: false, t: `Backup restored with ${Object.keys(d.entries).length} days of data${d.lift ? ` and ${d.lift.sessions.length} lifting sessions` : ""}.` });
         }
         catch {
-            setMsg({ err: true, t: "That doesn't look like a backup from this app. Use the full exported file or text." });
+            setMsg({ err: true, t: "That doesn't look like a backup or lift history from this app. Use the full exported file or text." });
         }
     };
     return (React.createElement("div", { className: "panel" },
@@ -1372,9 +1790,9 @@ function ExportPanel({ data, der, onImport }) {
             out && React.createElement("button", { className: "btn ghost sm", onClick: copy }, "Copy")),
         out && React.createElement("textarea", { className: "input", readOnly: true, value: out, style: { marginTop: 10 }, onFocus: (e) => e.target.select() }),
         React.createElement("h3", null, "Restore"),
-        React.createElement("p", { className: "note", style: { marginBottom: 8 } }, "Restoring replaces everything currently in the app. Backups from earlier versions work too."),
+        React.createElement("p", { className: "note", style: { marginBottom: 8 } }, "A backup replaces everything in the app, except that a backup without lifting data keeps the lifting you have. A lift history file only loads your lifting and leaves your weigh-ins alone."),
         React.createElement("label", { className: "btn ghost sm filebtn" },
-            "Choose backup file",
+            "Choose backup or lift file",
             React.createElement("input", { type: "file", accept: ".json,application/json,text/plain", onChange: async (e) => {
                     const fl = e.target.files && e.target.files[0];
                     if (fl)
@@ -1472,7 +1890,7 @@ function App() {
     const [tab, setTab] = useState("today");
     const [storeErr, setStoreErr] = useState(null);
     const [prefill, setPrefill] = useState(readPrefill);
-    const [showSettings, setShowSettings] = useState(false);
+    const [showSettings, setShowSettings] = useState(null);
     const persist = async (next) => {
         setData(next);
         try {
@@ -1521,7 +1939,10 @@ function App() {
         return () => { alive = false; };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
-    const der = useMemo(() => (data ? derive(data, today) : null), [data, today]);
+    const liftRun = useMemo(() => (data && data.lift ? runLift(data.lift, data.entries) : null), 
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [data && data.lift && data.lift.sessions, data && data.lift && data.lift.overrides, data && data.lift && data.lift.program, data && data.entries]);
+    const der = useMemo(() => (data ? derive(data, today, liftRun) : null), [data, today, liftRun]);
     const saveCheckIn = (date, vals) => {
         const entries = { ...data.entries };
         const pk = addDays(date, -1);
@@ -1544,7 +1965,7 @@ function App() {
         persist({ ...data, entries });
     };
     const shell = (children) => (React.createElement("div", { className: "ct" },
-        React.createElement("style", null, CSS),
+        React.createElement("style", null, CSS + LIFT_CSS),
         React.createElement("div", { className: "sbar" }),
         React.createElement("div", { className: "wrap" }, children)));
     if (!data || !der)
@@ -1555,7 +1976,7 @@ function App() {
     return shell(React.createElement(React.Fragment, null,
         React.createElement("div", { className: "top" },
             React.createElement("div", { className: "brand" }, "Cut tracker"),
-            React.createElement("button", { className: "gear", "aria-label": "Settings", onClick: () => setShowSettings(true) },
+            React.createElement("button", { className: "gear", "aria-label": "Settings", onClick: () => setShowSettings("all") },
                 React.createElement("svg", { width: "22", height: "22", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "1.8", strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" },
                     React.createElement("circle", { cx: "12", cy: "12", r: "3" }),
                     React.createElement("path", { d: "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" })))),
@@ -1564,13 +1985,635 @@ function App() {
             React.createElement(Stat, { v: der.avgNow != null ? fmt1(der.avgNow) : "–", l: "7-day average" }),
             React.createElement(Stat, { v: rate != null ? `${rate >= 0 ? "−" : "+"}${fmt1(Math.abs(rate))}` : "–", l: "lb/week, 2-wk trend" }),
             React.createElement(Stat, { v: toGo != null ? fmt1(Math.max(0, toGo)) : "–", l: `lb to ${s.goalHigh}` })),
-        React.createElement("nav", { className: "tabs", role: "tablist", "aria-label": "Sections" }, [["today", "Today"], ["trend", "Trend"], ["watch", "Watch"], ["history", "History"]].map(([id, label]) => (React.createElement("button", { key: id, role: "tab", className: "tab", "aria-selected": tab === id, onClick: () => setTab(id) }, label)))),
+        React.createElement("nav", { className: "tabs", role: "tablist", "aria-label": "Sections" }, [["today", "Today"], ["lift", "Lift"], ["trend", "Trend"], ["watch", "Watch"], ["history", "History"]].map(([id, label]) => (React.createElement("button", { key: id, role: "tab", className: "tab", "aria-selected": tab === id, onClick: () => setTab(id) }, label)))),
         storeErr && React.createElement("p", { className: "err" }, storeErr),
-        tab === "today" && (React.createElement(TodayTab, { data: data, der: der, today: today, onSave: saveCheckIn, prefill: prefill, onPrefillUsed: () => setPrefill(null), onRestore: () => setTab("history") })),
+        tab === "today" && (React.createElement(TodayTab, { data: data, der: der, today: today, onSave: saveCheckIn, prefill: prefill, onPrefillUsed: () => setPrefill(null), onRestore: () => setShowSettings("data"), liftRun: liftRun, onOpenLift: () => setTab("lift") })),
+        tab === "lift" && (React.createElement(LiftTab, { data: data, der: der, run: liftRun, pal: pal, onOpenData: () => setShowSettings("data"), onLift: (lift) => persist({ ...data, lift }) })),
         tab === "trend" && React.createElement(TrendTab, { data: data, der: der, today: today, pal: pal }),
         tab === "watch" && React.createElement(WatchTab, { data: data, der: der, pal: pal, today: today }),
         tab === "history" && React.createElement(HistoryTab, { data: data, onSaveEntry: saveEntry }),
-        showSettings && (React.createElement(SettingsSheet, { data: data, der: der, onClose: () => setShowSettings(false), onSaveSettings: (settings) => persist({ ...data, settings }), onImport: (d) => persist(withGiven(d, today)) }))));
+        showSettings && (React.createElement(SettingsSheet, { data: data, der: der, focus: showSettings, onClose: () => setShowSettings(null), onSaveSettings: (settings) => persist({ ...data, settings }), onImport: (d) => persist(withGiven(d, today)) }))));
+}
+/* ---------- lift: small pieces ---------- */
+const LIFT_CSS = `
+.stp{display:inline-flex;align-items:center;gap:4px}
+.stp button{appearance:none;width:38px;height:38px;border-radius:10px;border:1.5px solid var(--line);background:var(--bg);color:var(--ink);font:inherit;font-size:20px;line-height:1;cursor:pointer}
+.stp input{width:58px;height:38px;text-align:center;font:inherit;font-size:17px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--ink);background:transparent;border:0;border-bottom:1.5px dashed var(--line);border-radius:0;padding:0}
+.stp .v{min-width:30px;text-align:center;font-size:17px;font-weight:600;font-variant-numeric:tabular-nums}
+.chips{display:flex;gap:4px;margin-top:8px}
+.chips button{flex:1;min-width:0;appearance:none;height:34px;border-radius:8px;border:1.5px solid var(--line);background:transparent;color:var(--muted);font:inherit;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;cursor:pointer;padding:0}
+.chips button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.xcard{background:var(--surface);border-radius:16px;padding:14px 14px 12px;margin-top:12px}
+.xhead{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.xname{font-weight:600;font-size:17px}
+.tag{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:2px 8px;white-space:nowrap}
+.tag.anchor{color:var(--accent);border-color:var(--accent)}
+.xtarget{font-size:14px;margin-top:2px}
+.xlast{font-size:13px;color:var(--muted);margin-top:2px}
+.setrow{padding:10px 0 12px;border-top:1px solid var(--line);margin-top:10px}
+.setline{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.setno{width:20px;font-weight:600;color:var(--muted);font-variant-numeric:tabular-nums}
+.setlab{font-size:12px;color:var(--muted);margin-right:-4px}
+.xfoot{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+.outcome{font-size:14px;margin-top:10px;padding-left:10px;border-left:3px solid var(--line)}
+.outcome.good{border-color:var(--good);color:var(--ink)} .outcome.warn{border-color:var(--warn);color:var(--ink)} .outcome.muted{color:var(--muted)}
+.daychips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 12px}
+.daychips button{appearance:none;border:1.5px solid var(--line);background:transparent;color:var(--muted);border-radius:999px;padding:6px 12px;font:inherit;font-size:14px;cursor:pointer}
+.daychips button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent);font-weight:600}
+.plan li{margin:4px 0}
+.plan{margin:6px 0 0;padding-left:20px}
+.sumline{padding:10px 0;border-bottom:1px solid var(--line)}
+.sumline:last-child{border-bottom:0}
+.chk{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--muted)}
+.chk input{width:20px;height:20px;accent-color:var(--accent)}
+`;
+function Stepper({ value, onChange, step, label, typed, bw, start }) {
+    const [txt, setTxt] = useState(null);
+    const bump = (d) => {
+        if (!isNum(value) && isNum(start))
+            return onChange(start);
+        const base = isNum(value) ? value : 0;
+        onChange(Math.max(bw ? -500 : 0, Math.round((base + d) * 10) / 10));
+    };
+    return (React.createElement("div", { className: "stp", role: "group", "aria-label": label },
+        React.createElement("button", { "aria-label": `Less ${label}`, onClick: () => bump(-step) }, "\u2212"),
+        typed ? (React.createElement("input", { inputMode: "decimal", "aria-label": label, value: txt != null ? txt : value == null ? "" : bw ? fmtW(value, true) : String(value), placeholder: "\u2013", onFocus: (e) => { setTxt(value == null ? "" : String(value)); setTimeout(() => e.target.select(), 0); }, onChange: (e) => setTxt(e.target.value), onBlur: () => { const n = parseNum(txt); if (n != null && !Number.isNaN(n))
+                onChange(n); setTxt(null); } })) : (React.createElement("span", { className: "v" }, value == null ? "–" : value)),
+        React.createElement("button", { "aria-label": `More ${label}`, onClick: () => bump(step) }, "+")));
+}
+function RpeChips({ value, onPick }) {
+    return (React.createElement("div", { className: "chips", role: "group", "aria-label": "RPE" }, RPE_CHOICES.map((r) => (React.createElement("button", { key: r, "aria-pressed": value === r, onClick: () => onPick(value === r ? null : r) }, String(r))))));
+}
+function lastReadOf(lift, key, beforeId) {
+    const ss = [...(lift.sessions || [])].sort(sessionOrder);
+    for (let i = ss.length - 1; i >= 0; i--) {
+        const s = ss[i];
+        if (s.id === beforeId)
+            continue;
+        const r = (s.exercises || []).find((x) => (x.key || keyFor(lift.program, s.dayId, x.ex)) === key && !x.skipped && workSets(x.sets).length);
+        if (r)
+            return { date: s.date, sets: workSets(r.sets) };
+    }
+    return null;
+}
+function setsText(sets, bw) {
+    const ws = workSets(sets);
+    if (!ws.length)
+        return "";
+    const sameW = ws.every((s) => s.w === ws[0].w);
+    const reps = ws.map((s) => (isNum(s.reps) ? s.reps : "?")).join(", ");
+    const rpes = ws.map((s) => (isNum(s.rpe) ? s.rpe : "?")).join(", ");
+    return sameW ? `${fmtW(ws[0].w, bw)} for ${reps} at RPE ${rpes}` : ws.map((s) => `${fmtW(s.w, bw)}×${s.reps ?? "?"}${isNum(s.rpe) ? ` @${s.rpe}` : ""}`).join(", ");
+}
+function targetText(slot, w, bw) {
+    const rpe = slot.role === "secondary" ? "about RPE 7" : "work 7–8, last set 8–9";
+    return `${slot.sets}×${repsText(slot)} at ${w == null ? "a weight you pick" : fmtW(w, bw)}, ${rpe}`;
+}
+/* ---------- logging ---------- */
+function ExerciseCard({ x, i, draft, lift, run, preview, onChange }) {
+    const program = lift.program;
+    const meta = exMeta(program, x.ex);
+    const bw = meta.equip === "bodyweight";
+    const slot = slotFor(program, x.key, draft.dayId) || { sets: x.sets.length || 3, lo: 10, hi: 10, role: "accessory" };
+    const st = run.state[x.key];
+    const last = lastReadOf(lift, x.key, draft.id);
+    const [skipOpen, setSkipOpen] = useState(false);
+    const upd = (patch) => onChange({ ...x, ...patch });
+    const setSet = (j, patch, forward) => {
+        const sets = x.sets.map((s, k) => {
+            if (k === j)
+                return { ...s, ...patch };
+            if (forward && k > j && !isNum(s.rpe))
+                return { ...s, ...patch };
+            return s;
+        });
+        upd({ sets });
+    };
+    const roleTag = slot.role === "main" ? "Anchor" : slot.role === "secondary" ? "Secondary" : slot.role === "core" ? "Core" : null;
+    const allRated = x.sets.length > 0 && x.sets.every((s) => isNum(s.rpe));
+    const pv = preview && preview.find((e) => e.key === x.key);
+    const out = pv && (allRated || x.skipped) ? outcomeText(pv, program) : null;
+    const showDrop = st && st.fresh && isNum(st.prevW) && x.sets[0] && isNum(x.sets[0].rpe) && x.sets[0].rpe >= LIFT.hot && x.sets.slice(1).some((s) => !isNum(s.rpe));
+    return (React.createElement("div", { className: "xcard" },
+        React.createElement("div", { className: "xhead" },
+            React.createElement("span", { className: "xname" }, meta.name),
+            roleTag && React.createElement("span", { className: `tag ${slot.role === "main" ? "anchor" : ""}` }, roleTag)),
+        React.createElement("div", { className: "xtarget" }, targetText(slot, x.presc, bw)),
+        last && React.createElement("div", { className: "xlast" },
+            "Last time, ",
+            fmtDay(last.date),
+            ": ",
+            setsText(last.sets, bw)),
+        st && st.fresh && isNum(st.prevW) && React.createElement("div", { className: "xlast" },
+            "New weight this time (up from ",
+            fmtW(st.prevW, bw),
+            ")."),
+        x.skipped ? (React.createElement("div", { className: "xfoot" },
+            React.createElement("span", { className: "note" },
+                "Skipped (",
+                x.skipped,
+                ")."),
+            React.createElement("button", { className: "link", style: { marginTop: 0 }, onClick: () => upd({ skipped: null }) }, "Undo"))) : (React.createElement(React.Fragment, null,
+            x.sets.map((s, j) => (React.createElement("div", { className: "setrow", key: j },
+                React.createElement("div", { className: "setline" },
+                    React.createElement("span", { className: "setno" }, j + 1),
+                    React.createElement("span", { className: "setlab" }, "lb"),
+                    React.createElement(Stepper, { label: `weight, set ${j + 1}`, value: s.w, step: meta.step, typed: true, bw: bw, onChange: (v) => setSet(j, { w: v }, true) }),
+                    React.createElement("span", { className: "setlab" }, "reps"),
+                    React.createElement(Stepper, { label: `reps, set ${j + 1}`, value: s.reps, step: 1, onChange: (v) => setSet(j, { reps: v }, true) })),
+                React.createElement(RpeChips, { value: s.rpe, onPick: (r) => setSet(j, { rpe: r }, false) })))),
+            showDrop && (React.createElement("div", { className: "outcome warn" },
+                "First set at 9 or higher on a new weight. Drop to ",
+                fmtW(st.prevW, bw),
+                " for the rest.",
+                React.createElement("div", null,
+                    React.createElement("button", { className: "btn sm", style: { marginTop: 8 }, onClick: () => upd({ sets: x.sets.map((s, k) => (k > 0 && !isNum(s.rpe) ? { ...s, w: st.prevW } : s)) }) },
+                        "Drop to ",
+                        fmtW(st.prevW, bw))))),
+            React.createElement("div", { className: "xfoot" },
+                React.createElement("button", { className: "btn ghost sm", onClick: () => upd({ sets: [...x.sets, { ...(x.sets[x.sets.length - 1] || { w: x.presc, reps: slot.lo }), rpe: null }] }) }, "+ Set"),
+                React.createElement("button", { className: "btn ghost sm", disabled: !x.sets.length, onClick: () => upd({ sets: x.sets.slice(0, -1) }) }, "\u2212 Set"),
+                !skipOpen
+                    ? React.createElement("button", { className: "btn ghost sm", onClick: () => setSkipOpen(true) }, "Skip")
+                    : ["time", "equipment", "pain", "other"].map((r) => React.createElement("button", { key: r, className: "btn ghost sm", onClick: () => { upd({ skipped: r }); setSkipOpen(false); } }, r[0].toUpperCase() + r.slice(1))),
+                React.createElement("label", { className: "chk" },
+                    React.createElement("input", { type: "checkbox", checked: !!x.pain, onChange: (e) => upd({ pain: e.target.checked }) }),
+                    "Pain")))),
+        out && React.createElement("div", { className: `outcome ${out.tone}` }, out.text)));
+}
+function SessionLogger({ data, lift, run, onDraft, onFinish, onDiscard }) {
+    const d = lift.draft;
+    const program = lift.program;
+    const day = program.days[d.dayId] || { name: d.dayId, floor: 400 };
+    const [confirm, setConfirm] = useState(false);
+    const [adding, setAdding] = useState(false);
+    const preview = useMemo(() => previewSession(run, { ...draftToSession(d), date: d.date }), [run, d]);
+    const set = (patch) => onDraft({ ...d, ...patch });
+    const setEx = (i, x) => onDraft({ ...d, exercises: d.exercises.map((y, k) => (k === i ? x : y)) });
+    const fuelOk = !isNum(d.fuel) || d.fuel >= day.floor - LIFT.fuelGrace;
+    const exChoices = Object.entries(program.exercises).sort((a, b) => a[1].name.localeCompare(b[1].name));
+    return (React.createElement(React.Fragment, null,
+        React.createElement("section", { className: "sec" },
+            React.createElement("h2", null,
+                day.name,
+                ", week ",
+                d.week),
+            React.createElement("p", { className: "note" },
+                fmtDayLong(d.date),
+                ". Plan loaded from your rules. Tap an RPE to log each set."),
+            React.createElement("div", { className: "panel", style: { marginTop: 10 } },
+                React.createElement("div", { className: "field" },
+                    React.createElement("span", { style: { display: "block", fontSize: 14, color: "var(--muted)", marginBottom: 6 } }, "Where"),
+                    React.createElement("div", { className: "seg", role: "group", "aria-label": "Venue", style: { marginBottom: 0 } },
+                        React.createElement("button", { "aria-pressed": d.venue === "home", onClick: () => set({ venue: "home" }) }, "Home gym"),
+                        React.createElement("button", { "aria-pressed": d.venue === "away", onClick: () => set({ venue: "away" }) }, "Somewhere else")),
+                    d.venue === "away" && React.createElement("p", { className: "note", style: { marginTop: 6 } }, "Barbell, dumbbell and bodyweight lifts still count. Machines and cables don't.")),
+                React.createElement("div", { className: "field" },
+                    React.createElement("span", { style: { display: "block", fontSize: 14, color: "var(--muted)", marginBottom: 6 } }, "Pre-workout calories"),
+                    React.createElement(Stepper, { label: "pre-workout calories", value: d.fuel, step: 50, typed: true, start: day.floor, onChange: (v) => set({ fuel: v }) }),
+                    React.createElement("p", { className: fuelOk ? "note" : "err", style: { marginTop: 6 } },
+                        "Floor ",
+                        day.floor,
+                        ". It still counts from ",
+                        day.floor - LIFT.fuelGrace,
+                        fuelOk ? "." : ", so today's lifts won't move weights.")),
+                React.createElement("label", { className: "chk" },
+                    React.createElement("input", { type: "checkbox", checked: !!d.deload, onChange: (e) => set({ deload: e.target.checked }) }),
+                    "Deload week (nothing bumps)"))),
+        d.exercises.map((x, i) => (React.createElement(ExerciseCard, { key: `${x.key}-${i}`, x: x, i: i, draft: d, lift: lift, run: run, preview: preview, onChange: (nx) => setEx(i, nx) }))),
+        React.createElement("div", { style: { marginTop: 12 } }, !adding ? React.createElement("button", { className: "btn ghost sm", onClick: () => setAdding(true) }, "+ Add exercise") : (React.createElement("select", { className: "input sm", defaultValue: "", onChange: (e) => {
+                const ex = e.target.value;
+                if (!ex)
+                    return;
+                const key = keyFor(program, d.dayId, ex);
+                const st = run.state[key];
+                const slot = slotFor(program, key, d.dayId) || { sets: 3, lo: 10, hi: 10 };
+                onDraft({ ...d, exercises: [...d.exercises, { key, ex, presc: st ? st.w : null, sets: prefillSets(slot, st), skipped: null, pain: false }] });
+                setAdding(false);
+            } },
+            React.createElement("option", { value: "" }, "Pick an exercise"),
+            exChoices.map(([id, m]) => React.createElement("option", { key: id, value: id }, m.name))))),
+        React.createElement("section", { className: "sec" },
+            React.createElement("h2", null, "Wrap up"),
+            React.createElement("div", { className: "panel" },
+                React.createElement("div", { className: "field" },
+                    React.createElement("span", { style: { display: "block", fontSize: 14, color: "var(--muted)" } }, "Session RPE"),
+                    React.createElement(RpeChips, { value: d.srpe, onPick: (r) => set({ srpe: r }) })),
+                React.createElement("div", { className: "row2" },
+                    React.createElement("label", { className: "field" },
+                        React.createElement("span", null, "Minutes"),
+                        React.createElement("input", { className: "input sm", inputMode: "numeric", value: d.duration ?? "", onChange: (e) => { const n = parseNum(e.target.value); set({ duration: n == null || Number.isNaN(n) ? null : n }); } })),
+                    React.createElement("div", { className: "field" },
+                        React.createElement("span", { style: { display: "block", fontSize: 14, color: "var(--muted)", marginBottom: 5 } }, "Stretched after"),
+                        React.createElement("div", { className: "seg", role: "group", "aria-label": "Stretched", style: { marginBottom: 0 } },
+                            React.createElement("button", { "aria-pressed": d.stretched === true, onClick: () => set({ stretched: true }) }, "Yes"),
+                            React.createElement("button", { "aria-pressed": d.stretched === false, onClick: () => set({ stretched: false }) }, "No")))),
+                React.createElement("label", { className: "field" },
+                    React.createElement("span", null, "Notes"),
+                    React.createElement("textarea", { className: "input", style: { fontFamily: "var(--body)", fontSize: 15, minHeight: 80 }, value: d.notes, onChange: (e) => set({ notes: e.target.value }) })),
+                React.createElement("button", { className: "btn", onClick: onFinish }, "Finish session"),
+                React.createElement("div", { className: "btns" }, !confirm ? React.createElement("button", { className: "btn danger sm", onClick: () => setConfirm(true) }, "Discard session")
+                    : React.createElement(React.Fragment, null,
+                        React.createElement("button", { className: "btn danger sm", onClick: onDiscard }, "Yes, discard it"),
+                        React.createElement("button", { className: "btn ghost sm", onClick: () => setConfirm(false) }, "Keep it")))))));
+}
+/* ---------- summaries and exports ---------- */
+function sessionContext(data, der, s, skipFuel) {
+    const E = data.entries;
+    const y = addDays(s.date, -1);
+    const ey = E[y] || {};
+    const tgt = data.given[y] ?? (der.byKey[y] ? der.byKey[y].target : null);
+    const bw = avg7(E, s.date);
+    const parts = [];
+    if (isNum(bw))
+        parts.push(`7-day average weight ${fmt1(bw)} lb`);
+    if (isNum(ey.intake))
+        parts.push(`ate ${fmtInt(ey.intake)} the day before${isNum(tgt) ? ` (target ${fmtInt(tgt)})` : ""}`);
+    if (isNum(s.fuel) && !skipFuel)
+        parts.push(`${fmtInt(s.fuel)} kcal pre-workout`);
+    const acts = [];
+    for (let i = 2; i <= 8; i++) {
+        const e = E[addDays(s.date, -i)];
+        if (e && isNum(e.active))
+            acts.push(e.active);
+    }
+    if (isNum(ey.active) && acts.length >= 3 && ey.active > mean(acts) * 1.4)
+        parts.push(`a big activity day before (${fmtInt(ey.active)} Move calories, usual ${fmtInt(mean(acts))})`);
+    return parts;
+}
+function entriesFor(run, sessionId) { return run.log.filter((e) => e.sessionId === sessionId); }
+function SessionSummary({ s, run, lift, data, der }) {
+    const program = lift.program;
+    const entries = entriesFor(run, s.id);
+    const [msg, setMsg] = useState(null);
+    const day = program.days[s.dayId];
+    const ctx = sessionContext(data, der, s);
+    const flags = entries.flatMap((e) => liftFlags(run, e.key).filter((f) => f.kind === "drift").map((f) => `${exMeta(program, e.ex).name}: ${f.text}`));
+    const share = async (kind) => {
+        const text = kind === "md" ? sessionMarkdown(s, run, lift, data, der) : claudePacket(s, run, lift, data, der);
+        if (kind === "md") {
+            const r = await shareFile(`${s.week}.${(program.cycle.indexOf(s.dayId) + 1) || 0} - ${day ? day.name : s.dayId} (${s.date}).md`, text, "text/markdown");
+            setMsg(r === "failed" ? { err: true, t: "Couldn't export here." } : { err: false, t: r === "cancelled" ? "" : "Exported." });
+        }
+        else {
+            try {
+                await navigator.clipboard.writeText(text);
+                setMsg({ err: false, t: "Copied. Paste it into the Gym Progress Tracking project." });
+            }
+            catch {
+                setMsg({ err: true, t: "Copy was blocked. Use Export for Obsidian instead." });
+            }
+        }
+    };
+    return (React.createElement("div", null,
+        entries.map((e, i) => {
+            const read = s.exercises[i] || {};
+            const meta = exMeta(program, e.ex);
+            const o = outcomeText(e, program);
+            return (React.createElement("div", { className: "sumline", key: i },
+                React.createElement("div", { style: { fontWeight: 600 } }, meta.name),
+                !read.skipped && React.createElement("div", { className: "note" }, setsText(read.sets, meta.equip === "bodyweight")),
+                React.createElement("div", { className: `outcome ${o.tone}`, style: { marginTop: 6 } }, o.text)));
+        }),
+        ctx.length > 0 && React.createElement("p", { className: "note", style: { marginTop: 10 } },
+            "Context: ",
+            ctx.join(", "),
+            "."),
+        flags.map((f, i) => React.createElement("p", { key: i, className: "status warn" }, f)),
+        React.createElement("div", { className: "btns" },
+            React.createElement("button", { className: "btn sm", onClick: () => share("claude") }, "Copy for Claude"),
+            React.createElement("button", { className: "btn ghost sm", onClick: () => share("md") }, "Export for Obsidian")),
+        msg && msg.t && React.createElement("p", { className: msg.err ? "err" : "ok" }, msg.t)));
+}
+function nextTemplateRows(run, lift, dayId) {
+    const day = lift.program.days[dayId];
+    return day.slots.map((slot) => {
+        const st = run.state[slot.key];
+        const meta = exMeta(lift.program, slot.ex);
+        return { name: meta.name, w: st ? st.w : null, bw: meta.equip === "bodyweight", slot };
+    });
+}
+function sessionMarkdown(s, run, lift, data, der) {
+    const program = lift.program;
+    const day = program.days[s.dayId] || { name: s.dayId, anchor: "" };
+    const entries = entriesFor(run, s.id);
+    const bw = avg7(data.entries, s.date);
+    const L = [];
+    L.push("## Session Overview", "");
+    L.push(`- **Day Type:** ${day.name} · ${day.anchor} Anchor (${program.name}, W${s.week}${s.deload ? " · deload" : ""})`);
+    if (isNum(s.srpe))
+        L.push(`- **Overall Session RPE:** ${s.srpe}`);
+    if (isNum(s.duration))
+        L.push(`- **Duration:** ${s.duration} min`);
+    L.push(`- **Venue:** ${s.venue === "home" ? "Normal gym" : "Away from home gym"}`);
+    if (isNum(s.fuel))
+        L.push(`- **Fuel:** ~${fmtInt(s.fuel)} cals pre-workout`);
+    if (isNum(bw))
+        L.push(`- **Bodyweight:** ${fmt1(bw)} lb (7-day average)`);
+    if (s.notes)
+        L.push(`- **Notes:** ${s.notes}`);
+    L.push("", "---", "", "## Lifts", "");
+    entries.forEach((e, i) => {
+        const read = s.exercises[i] || {};
+        const meta = exMeta(program, e.ex);
+        const isBw = meta.equip === "bodyweight";
+        const slot = slotFor(program, e.key, s.dayId);
+        const role = slot ? (slot.role === "main" ? " (Anchor)" : slot.role === "secondary" ? " _(secondary)_" : slot.role === "core" ? " _(core)_" : "") : "";
+        L.push(`### ${meta.name}${role}`, "");
+        if (read.skipped) {
+            L.push(`- **Skipped** (${read.skipped}).`, "");
+            return;
+        }
+        L.push("|Set|Weight|Reps|RPE|Notes|", "|---|---|---|---|---|");
+        workSets(read.sets).forEach((x, j) => L.push(`|${j + 1}|${fmtW(x.w, isBw)}|${x.reps ?? ""}|${x.rpe ?? ""}||`));
+        L.push("");
+        const tgt = slot ? `${slot.sets}×${repsText(slot)}` : "";
+        L.push(`- **Target:** ${tgt}${slot && slot.role !== "secondary" ? " @7-8, last set 8-9" : ""}. ${outcomeText(e, program).text}`, "");
+    });
+    L.push("---", "", "## Post-Session", "", `- Stretch: **${s.stretched === true ? "done" : s.stretched === false ? "skipped" : "not logged"}.**`, "");
+    L.push("---", "", "## Progress Snapshot", "", "|Exercise|Result|Next|", "|---|---|---|");
+    entries.forEach((e, i) => {
+        const read = s.exercises[i] || {};
+        const meta = exMeta(program, e.ex);
+        L.push(`|${meta.name}|${read.skipped ? "Skipped" : setsText(read.sets, meta.equip === "bodyweight")}|${fmtW(e.nextW, meta.equip === "bodyweight")}|`);
+    });
+    const nu = nextUp(lift);
+    const nd = program.days[nu.dayId];
+    if (nd) {
+        L.push("", "---", "", `## Next Session: ${nd.name} (W${nu.week})`, "", "|#|Exercise|Weight|Sets x Reps|", "|---|---|---|---|");
+        nextTemplateRows(run, lift, nu.dayId).forEach((r, i) => L.push(`|${i + 1}|${r.name}|${r.w == null ? "pick" : fmtW(r.w, r.bw)}|${r.slot.sets} x ${repsText(r.slot)}|`));
+    }
+    return L.join("\n") + "\n";
+}
+function claudePacket(s, run, lift, data, der) {
+    const program = lift.program;
+    const day = program.days[s.dayId] || { name: s.dayId };
+    const entries = entriesFor(run, s.id);
+    const L = [];
+    L.push(`Session to review: ${day.name} (W${s.week}), ${fmtDayLong(s.date)}, ${s.venue === "home" ? "home gym" : "away from home gym"}${s.deload ? ", deload week" : ""}.`);
+    const bits = [];
+    if (isNum(s.fuel))
+        bits.push(`Pre-workout ${fmtInt(s.fuel)} kcal (floor ${day.floor})`);
+    if (isNum(s.srpe))
+        bits.push(`session RPE ${s.srpe}`);
+    if (isNum(s.duration))
+        bits.push(`${s.duration} min`);
+    if (s.stretched != null)
+        bits.push(`stretched: ${s.stretched ? "yes" : "no"}`);
+    if (bits.length)
+        L.push(bits.join(", ") + ".");
+    if (s.notes)
+        L.push(`Notes: ${s.notes}`);
+    const r = der.byKey[s.date] || der.row;
+    const ctx = sessionContext(data, der, s, true);
+    if (der.t14)
+        ctx.push(der.t14.rateWk >= 0 ? `losing ${fmt1(der.t14.rateWk)} lb/week over two weeks` : `gaining ${fmt1(-der.t14.rateWk)} lb/week over two weeks`);
+    if (r && isNum(r.target))
+        ctx.push(`calorie target ${fmtInt(r.target)}`);
+    if (ctx.length)
+        L.push(`Cut context: ${ctx.join(", ")}.`);
+    L.push("", "Lifts (what I did, then the app's rule decision):");
+    entries.forEach((e, i) => {
+        const read = s.exercises[i] || {};
+        const meta = exMeta(program, e.ex);
+        const bw = meta.equip === "bodyweight";
+        const sc = isNum(e.e1rm) && MAIN_LIFTS.includes(e.key) ? ` Est. 1RM ${fmtInt(e.e1rm)}${isNum(e.bw) ? ` (${(e.e1rm / e.bw).toFixed(2)}× bodyweight)` : ""}.` : "";
+        L.push(`- ${meta.name}: ${read.skipped ? `skipped (${read.skipped})` : setsText(read.sets, bw)}. ${outcomeText(e, program).text}${sc}`);
+    });
+    const sc = strengthChange(run, s.date);
+    if (sc && isNum(sc.change))
+        L.push("", `Main lifts vs three weeks ago: ${sc.change >= 0 ? "+" : ""}${(sc.change * 100).toFixed(1)}% across ${sc.n} lifts.`);
+    const fl = entries.flatMap((e) => liftFlags(run, e.key).map((f) => `${exMeta(program, e.ex).name}: ${f.text}`));
+    if (fl.length)
+        L.push("Flags: " + fl.join(" "));
+    L.push("", "Give me the coaching recap in my usual format. The weights for next time are already decided by the app's rules, so focus on what the session says, not on changing loads.");
+    return L.join("\n");
+}
+/* ---------- lift tab ---------- */
+const LIFT_NAMES = { "bench@main": "Bench", "ohp@main": "OHP", "squat@main": "Squat", "rdl@main": "RDL", "row@main": "Row", "pullup@main": "Pull-ups", "pulldown@main": "Pulldown" };
+function StrengthSection({ run, lift, data, pal }) {
+    const [sel, setSel] = useState("squat@main");
+    const today = todayKey();
+    const rows = MAIN_LIFTS.map((key) => {
+        const arr = run.reads[key] || [];
+        const last = arr[arr.length - 1];
+        let base = null;
+        if (last)
+            for (const r of arr)
+                if (r.date <= addDays(last.date, -21))
+                    base = r;
+        const st = run.state[key];
+        const meta = exMeta(lift.program, exOf(key));
+        return { key, name: LIFT_NAMES[key], w: st ? st.w : null, bw: meta.equip === "bodyweight", last, base };
+    }).filter((r) => r.last);
+    const arr = (run.reads[sel] || []).filter((r) => r.date >= addDays(today, -200));
+    const chart = arr.map((r) => ({ x: dayNum(r.date), e1: Math.round(r.e1rm) }));
+    const sc = strengthChange(run, today);
+    return (React.createElement("section", { className: "sec" },
+        React.createElement("h2", null, "Strength"),
+        React.createElement("table", { className: "tbl" },
+            React.createElement("thead", null,
+                React.createElement("tr", null,
+                    React.createElement("th", null, "Lift"),
+                    React.createElement("th", { className: "r" }, "Working"),
+                    React.createElement("th", { className: "r" }, "Est. 1RM"),
+                    React.createElement("th", { className: "r" }, "\u00D7 BW"),
+                    React.createElement("th", { className: "r" }, "3 wk"))),
+            React.createElement("tbody", null, rows.map((r) => (React.createElement("tr", { key: r.key },
+                React.createElement("td", null, r.name),
+                React.createElement("td", { className: "r" }, fmtW(r.w, r.bw)),
+                React.createElement("td", { className: "r" }, fmtInt(r.last.e1rm)),
+                React.createElement("td", { className: "r" }, isNum(r.last.bw) ? (r.last.e1rm / r.last.bw).toFixed(2) : React.createElement("span", { className: "dim" }, "\u2013")),
+                React.createElement("td", { className: "r" }, r.base ? `${r.last.e1rm >= r.base.e1rm ? "+" : "−"}${fmt1(Math.abs((r.last.e1rm / r.base.e1rm - 1) * 100))}%` : React.createElement("span", { className: "dim" }, "\u2013"))))))),
+        React.createElement("p", { className: "note", style: { marginTop: 8 } },
+            sc && isNum(sc.change) ? `Across your main lifts, strength is ${sc.change >= 0 ? "up" : "down"} ${fmt1(Math.abs(sc.change * 100))}% versus three weeks ago. ` : "",
+            "Only sessions that count go into these numbers. Pull-ups include your bodyweight."),
+        React.createElement("div", { className: "daychips", role: "group", "aria-label": "Lift to chart", style: { marginTop: 14 } }, MAIN_LIFTS.filter((k) => (run.reads[k] || []).length).map((k) => React.createElement("button", { key: k, "aria-pressed": sel === k, onClick: () => setSel(k) }, LIFT_NAMES[k]))),
+        chart.length > 1 && (React.createElement("div", { style: { width: "100%", height: 200 } },
+            React.createElement(ResponsiveContainer, null,
+                React.createElement(LineChart, { data: chart, margin: { top: 8, right: 10, bottom: 0, left: -10 } },
+                    React.createElement(CartesianGrid, { stroke: pal.line, strokeDasharray: "2 4", vertical: false }),
+                    React.createElement(XAxis, { type: "number", dataKey: "x", domain: ["dataMin", "dataMax"], tickFormatter: fmtDayN, tick: { fill: pal.muted, fontSize: 12 }, axisLine: { stroke: pal.line }, tickLine: false, tickCount: 4 }),
+                    React.createElement(YAxis, { domain: ["auto", "auto"], width: 46, tick: { fill: pal.muted, fontSize: 12 }, axisLine: false, tickLine: false }),
+                    React.createElement(Tooltip, { contentStyle: { background: pal.surface, border: `1px solid ${pal.line}`, borderRadius: 10, color: pal.ink, fontSize: 13 }, labelFormatter: fmtDayN, formatter: (v) => [fmtInt(v), "Est. 1RM"] }),
+                    React.createElement(Line, { dataKey: "e1", stroke: pal.accent, strokeWidth: 2.5, dot: { r: 2.5, fill: pal.accent, stroke: "none" }, isAnimationActive: false })))))));
+}
+function ProgramSection({ lift, run, onOverride }) {
+    const program = lift.program;
+    const [edit, setEdit] = useState(null);
+    const [val, setVal] = useState(null);
+    return (React.createElement("section", { className: "sec" },
+        React.createElement("h2", null, "Program"),
+        React.createElement("p", { className: "note", style: { marginBottom: 6 } },
+            program.name,
+            ". Weights move by the rules after each session. Tap a weight to set it by hand."),
+        program.cycle.map((dayId) => {
+            const day = program.days[dayId];
+            return (React.createElement("details", { className: "grp month", key: dayId },
+                React.createElement("summary", null,
+                    React.createElement("span", { className: "ttl" }, day.name),
+                    React.createElement("span", { className: "sum" },
+                        day.anchor,
+                        " anchor, fuel ",
+                        day.floor,
+                        "+")),
+                day.slots.map((slot) => {
+                    const st = run.state[slot.key];
+                    const meta = exMeta(program, slot.ex);
+                    const bw = meta.equip === "bodyweight";
+                    const k = `${dayId}:${slot.key}`;
+                    return (React.createElement("div", { className: "hist-row", key: k, style: { gridTemplateColumns: "1.6fr 1fr auto" } },
+                        React.createElement("span", null, meta.name),
+                        React.createElement("span", { className: "dim" },
+                            slot.sets,
+                            "\u00D7",
+                            repsText(slot)),
+                        edit === k ? (React.createElement("span", { style: { display: "flex", gap: 6, alignItems: "center" } },
+                            React.createElement(Stepper, { label: `${meta.name} weight`, value: val, step: meta.step, typed: true, bw: bw, onChange: setVal }),
+                            React.createElement("button", { className: "btn sm", onClick: () => { onOverride(slot.key, val); setEdit(null); } }, "Set"))) : (React.createElement("button", { className: "link", style: { marginTop: 0, fontVariantNumeric: "tabular-nums" }, onClick: () => { setEdit(k); setVal(st ? st.w : null); } }, st && st.w != null ? fmtW(st.w, bw) : "pick"))));
+                })));
+        })));
+}
+function PastSessions({ lift, run, data, der }) {
+    const program = lift.program;
+    const ss = [...(lift.sessions || [])].sort(sessionOrder).reverse();
+    const months = [];
+    ss.forEach((s) => {
+        const m = s.date.slice(0, 7);
+        let mo = months[months.length - 1];
+        if (!mo || mo.m !== m) {
+            mo = { m, list: [] };
+            months.push(mo);
+        }
+        mo.list.push(s);
+    });
+    return (React.createElement("section", { className: "sec" },
+        React.createElement("h2", null, "Past sessions"),
+        months.map((mo, mi) => (React.createElement("details", { className: "grp month", key: mo.m, open: mi === 0 },
+            React.createElement("summary", null,
+                React.createElement("span", { className: "ttl" },
+                    MONTHS_FULL[Number(mo.m.slice(5, 7)) - 1],
+                    " ",
+                    mo.m.slice(0, 4)),
+                React.createElement("span", { className: "sum" },
+                    mo.list.length,
+                    " sessions")),
+            mo.list.map((s) => {
+                const es = entriesFor(run, s.id);
+                const bumps = es.filter((e) => ["bump", "catchup"].includes(e.res.status)).length;
+                const day = program.days[s.dayId];
+                return (React.createElement("details", { className: "grp month", key: s.id, style: { marginLeft: 0 } },
+                    React.createElement("summary", null,
+                        React.createElement("span", { className: "ttl", style: { fontWeight: 500 } },
+                            fmtDayLong(s.date),
+                            ", ",
+                            day ? day.name : s.dayName || "Session"),
+                        React.createElement("span", { className: "sum" },
+                            bumps ? `${bumps} up` : "",
+                            s.deload ? " deload" : "")),
+                    React.createElement(SessionSummary, { s: s, run: run, lift: lift, data: data, der: der })));
+            }))))));
+}
+function LiftTab({ data, der, run, pal, onLift, onOpenData }) {
+    const lift = data.lift;
+    const today = todayKey();
+    const nu = lift ? nextUp(lift) : null;
+    const [pick, setPick] = useState(nu ? nu.dayId : null);
+    if (!lift) {
+        return (React.createElement("section", { className: "sec" },
+            React.createElement("h2", null, "Lifting"),
+            React.createElement("p", null, "No lift history yet. Import the lift history file to load your program and the last 22 weeks."),
+            React.createElement("button", { className: "btn ghost", style: { marginTop: 12 }, onClick: onOpenData }, "Import lift history")));
+    }
+    const setLift = (patch) => onLift({ ...lift, ...patch });
+    if (lift.draft) {
+        return (React.createElement(SessionLogger, { data: data, lift: lift, run: run, onDraft: (d) => setLift({ draft: d }), onDiscard: () => setLift({ draft: null }), onFinish: () => { const s = draftToSession(lift.draft); setLift({ draft: null, sessions: [...lift.sessions, s], lastFinished: s.id }); } }));
+    }
+    const program = lift.program;
+    const dayId = pick && program.days[pick] ? pick : nu.dayId;
+    const day = program.days[dayId];
+    const week = dayId === nu.dayId ? nu.week : nu.week;
+    const rows = nextTemplateRows(run, lift, dayId);
+    const finished = lift.lastFinished ? lift.sessions.find((s) => s.id === lift.lastFinished && s.date === today) : null;
+    return (React.createElement(React.Fragment, null,
+        finished && (React.createElement("section", { className: "sec" },
+            React.createElement("h2", null, "Today's session"),
+            React.createElement(SessionSummary, { s: finished, run: run, lift: lift, data: data, der: der }))),
+        React.createElement("section", { className: "sec" },
+            React.createElement("h2", null, finished ? "Next up" : `Next up: ${program.days[nu.dayId].name}`),
+            React.createElement("div", { className: "daychips", role: "group", "aria-label": "Pick a day" }, program.cycle.map((id) => React.createElement("button", { key: id, "aria-pressed": id === dayId, onClick: () => setPick(id) }, program.days[id].name))),
+            React.createElement("div", { className: "panel" },
+                React.createElement("p", { style: { fontWeight: 600 } },
+                    day.name,
+                    ", week ",
+                    week),
+                React.createElement("ol", { className: "plan" }, rows.map((r, i) => React.createElement("li", { key: i },
+                    r.name,
+                    ": ",
+                    r.w == null ? "pick a weight" : fmtW(r.w, r.bw),
+                    " for ",
+                    r.slot.sets,
+                    "\u00D7",
+                    repsText(r.slot)))),
+                React.createElement("p", { className: "note", style: { marginTop: 10 } },
+                    "Eat ",
+                    day.floor,
+                    "+ kcal before. It still counts from ",
+                    day.floor - LIFT.fuelGrace,
+                    "."),
+                React.createElement("button", { className: "btn", style: { marginTop: 12 }, onClick: () => setLift({ draft: buildDraft(lift, run, dayId, today, week) }) },
+                    "Start ",
+                    day.name))),
+        React.createElement(StrengthSection, { run: run, lift: lift, data: data, pal: pal }),
+        React.createElement(ProgramSection, { lift: lift, run: run, onOverride: (key, weight) => setLift({ overrides: [...(lift.overrides || []), { key, weight, date: today, at: Date.now() }] }) }),
+        React.createElement(PastSessions, { lift: lift, run: run, data: data, der: der })));
+}
+function TrainingCard({ data, run, today, onOpen }) {
+    const lift = data.lift;
+    if (!lift || !run)
+        return null;
+    let body;
+    if (lift.draft)
+        body = React.createElement("p", null,
+            (lift.program.days[lift.draft.dayId] || {}).name,
+            " is in progress.");
+    else {
+        const done = lift.sessions.filter((s) => s.date === today);
+        if (done.length) {
+            const es = done.flatMap((s) => entriesFor(run, s.id));
+            const up = es.filter((e) => ["bump", "catchup"].includes(e.res.status)).length;
+            body = React.createElement("p", null,
+                "Done today: ",
+                done.map((s) => (lift.program.days[s.dayId] || {}).name || "session").join(", "),
+                ". ",
+                up ? `${up} lift${up === 1 ? "" : "s"} moving up next time.` : "Everything holds.");
+        }
+        else {
+            const nu = nextUp(lift);
+            const day = lift.program.days[nu.dayId];
+            const lead = nextTemplateRows(run, lift, nu.dayId)[0];
+            body = React.createElement("p", null,
+                "Next up: ",
+                day.name,
+                ", week ",
+                nu.week,
+                ". ",
+                lead.name,
+                " ",
+                lead.w == null ? "" : `at ${fmtW(lead.w, lead.bw)} `,
+                "for ",
+                lead.slot.sets,
+                "\u00D7",
+                repsText(lead.slot),
+                " leads. Eat ",
+                day.floor,
+                "+ kcal before you lift.");
+        }
+    }
+    return (React.createElement("section", { className: "sec" },
+        React.createElement("h2", null, "Training"),
+        body,
+        React.createElement("button", { className: "btn ghost sm", style: { marginTop: 8 }, onClick: onOpen }, lift.draft ? "Resume session" : "Open Lift")));
 }
 createRoot(document.getElementById("root")).render(React.createElement(App, null));
 window.__cutTrackerLoaded = true;
