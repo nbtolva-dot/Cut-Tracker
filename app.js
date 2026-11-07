@@ -1,19 +1,40 @@
-// Cut tracker. Built from app.jsx.
+// Cut tracker v2. Built from app.jsx.
 import React, { useState, useEffect, useMemo } from "react";
 import { createRoot } from "react-dom/client";
 import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceArea, ReferenceLine, ResponsiveContainer, } from "recharts";
 /* ---------- constants ---------- */
-const KEY = "cut-tracker:v1";
+const KEY = "cut-tracker:v1"; // storage key stays the same; the data carries its own version
+const VERSION = 2;
 const KCAL_PER_LB = 3500;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+// Fixed model constants. Changing these changes the math, so they live here rather than in Settings.
+const MODEL = {
+    washoutDays: 14, // first two weeks of a cut: the scale is mostly water, so it is ignored for maintenance
+    windowDays: 21, // scale measurement window
+    minSpan: 10, // need at least this many days in the window before measuring
+    minWeighIns: 8,
+    coverage: 0.8, // fraction of days in the window that need calories logged
+    weeklyGain: 0.35, // how far one week of measurements moves the estimate
+    clamp: 600, // largest gap between measurement and estimate that counts
+    weeklyCap: 200, // weekly target never moves more than this
+    dailyCap: 100, // daily target never moves more than this
+    tef: 0.10, // energy spent digesting food, which the watch does not see
+    autocorr: 1.36, // error-bar inflation because scale noise lingers across days
+    calibDays: 28, // watch calibration window
+    calibMinWatch: 24, // watch days needed inside that window
+    watchCap: 150, // most the watch can move maintenance
+    watchFlag: 0.10, // activity change that gets called out
+};
+const DAILY_GAIN = 1 - Math.pow(1 - MODEL.weeklyGain, 1 / 7);
 const DEFAULTS = {
     heightIn: 71, age: 25, sex: "male", activity: 1.675,
     goalRate: 1.25, minRate: 1.0, maxRate: 1.5,
     goalLow: 180, goalHigh: 185, cutStart: "2026-10-12",
     sleepHours: 7.5, calorieFloor: 2000, proteinLow: 180, proteinHigh: 200,
+    targetMode: "daily", bottleOz: 24, shortcutName: "Cut check-in",
 };
-// Local storage on this device, same interface the Claude version used.
+// Local storage on this device.
 const storage = {
     async get(k) { const v = localStorage.getItem(k); if (v == null)
         throw new Error("missing"); return { key: k, value: v }; },
@@ -32,8 +53,9 @@ const fmtDay = (k) => { const d = new Date(dayNum(k) * 86400000); return `${MONT
 const fmtDayLong = (k) => `${DOW[dow(k)]} ${fmtDay(k)}`;
 const fmtDayYear = (k) => `${fmtDay(k)}, ${k.slice(0, 4)}`;
 const fmtDayN = (n) => fmtDay(keyOf(n));
-// weeks run Saturday to Friday
-const weekStart = (k) => addDays(k, -((dow(k) + 1) % 7));
+const weekStart = (k) => addDays(k, -((dow(k) + 1) % 7)); // weeks run Saturday to Friday
+const maxKey = (a, b) => (a > b ? a : b);
+const isKey = (s) => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
 /* ---------- number helpers ---------- */
 const isNum = (v) => typeof v === "number" && Number.isFinite(v);
 const mean = (a) => a.reduce((s, v) => s + v, 0) / a.length;
@@ -41,6 +63,7 @@ const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
 const round50 = (x) => Math.round(x / 50) * 50;
 const fmtInt = (x) => Math.round(x).toLocaleString("en-US");
 const fmt1 = (x) => (Math.round(x * 10) / 10).toFixed(1);
+const fmtSigned = (x) => `${x < 0 ? "−" : "+"}${fmtInt(Math.abs(x))}`;
 const parseNum = (s) => {
     const t = String(s ?? "").replace(/[^0-9.\-]/g, "").trim();
     if (!t)
@@ -48,25 +71,54 @@ const parseNum = (s) => {
     const v = Number(t);
     return Number.isFinite(v) ? v : NaN;
 };
-/* ---------- empty starting data ---------- */
+/* ---------- data versions ---------- */
 function emptyData() {
-    return { version: 1, entries: {}, weeks: {}, settings: { ...DEFAULTS } };
+    return { version: VERSION, entries: {}, given: {}, settings: { ...DEFAULTS } };
 }
-function normalize(d) {
-    if (!d || typeof d !== "object" || !d.entries)
+// Accepts v1 backups (Claude version or first GitHub version) and v2.
+function migrate(d, today) {
+    if (!d || typeof d !== "object" || !d.entries || typeof d.entries !== "object")
         return null;
-    return { version: 1, entries: d.entries || {}, weeks: d.weeks || {}, settings: { ...DEFAULTS, ...(d.settings || {}) } };
+    const out = { version: VERSION, entries: {}, given: { ...(d.given || {}) }, settings: { ...DEFAULTS, ...(d.settings || {}) } };
+    for (const [k, e] of Object.entries(d.entries)) {
+        if (!isKey(k) || !e || typeof e !== "object")
+            continue;
+        const n = {};
+        for (const f of ["weight", "intake", "protein", "active", "resting", "water"])
+            if (isNum(e[f]))
+                n[f] = e[f];
+        // v1 had one "watch" field. Every value logged so far was active energy only.
+        if (isNum(e.watch) && !isNum(n.active))
+            n.active = e.watch;
+        if (Object.keys(n).length)
+            out.entries[k] = n;
+    }
+    if ((d.version || 1) < 2) {
+        out.settings.targetMode = DEFAULTS.targetMode;
+        // keep a record of what v1 actually told you to eat, for the history table
+        for (const [ws, w] of Object.entries(d.weeks || {})) {
+            if (!w || !isNum(w.target) || !isKey(ws))
+                continue;
+            for (let i = 0; i < 7; i++) {
+                const day = addDays(ws, i);
+                if (day < today && !(day in out.given))
+                    out.given[day] = w.target;
+            }
+        }
+    }
+    return out;
 }
 /* ---------- model ---------- */
+function mifflin(lb, s) {
+    const base = 10 * lb * 0.453592 + 6.25 * s.heightIn * 2.54 - 5 * s.age;
+    return s.sex === "female" ? base - 161 : base + 5;
+}
+const perLb = (s) => 10 * 0.453592 * s.activity; // how much the formula's maintenance drops per pound lost
 function weightPts(entries, upTo) {
     return Object.keys(entries)
         .filter((k) => isNum(entries[k].weight) && (!upTo || k <= upTo))
         .sort()
         .map((k) => ({ k, x: dayNum(k), w: entries[k].weight }));
-}
-function latestWeightKey(entries, onOrBefore) {
-    const ks = Object.keys(entries).filter((k) => k <= onOrBefore && isNum(entries[k].weight)).sort();
-    return ks.length ? ks[ks.length - 1] : null;
 }
 function avg7(entries, k) {
     const v = [];
@@ -84,135 +136,214 @@ function linreg(pts) {
     let sxy = 0, sxx = 0;
     pts.forEach(([x, y]) => { sxy += (x - mx) * (y - my); sxx += (x - mx) ** 2; });
     const slope = sxx ? sxy / sxx : 0;
-    return { slope, at: (x) => my + slope * (x - mx), n };
+    const at = (x) => my + slope * (x - mx);
+    let ss = 0;
+    pts.forEach(([x, y]) => { ss += (y - at(x)) ** 2; });
+    const sd = n > 2 ? Math.sqrt(ss / (n - 2)) : 0;
+    return { slope, at, sxx, sd, n };
 }
-function mifflin(lb, s) {
-    const base = 10 * lb * 0.453592 + 6.25 * s.heightIn * 2.54 - 5 * s.age;
-    return s.sex === "female" ? base - 161 : base + 5;
-}
-// Weights from startK..endK, intake from startK..endK-1 (each day's food shows up on the next morning's scale).
-function windowStats(entries, startK, endK) {
-    const s0 = dayNum(startK), s1 = dayNum(endK);
-    const ws = [], intakes = [], watches = [];
-    for (let n = s0; n <= s1; n++) {
-        const e = entries[keyOf(n)];
+// Scale measurement of maintenance: weights lo..hi, calories lo..hi-1 (food shows up on the next morning's scale).
+function measure(E, lo, hi, minSpan = MODEL.minSpan) {
+    const n0 = dayNum(lo), n1 = dayNum(hi);
+    const span = n1 - n0;
+    const pts = [], ins = [];
+    for (let n = n0; n <= n1; n++) {
+        const e = E[keyOf(n)];
         if (!e)
             continue;
         if (isNum(e.weight))
-            ws.push([n - s1, e.weight]);
-        if (n < s1) {
-            if (isNum(e.intake))
-                intakes.push(e.intake);
-            if (isNum(e.watch))
-                watches.push(e.watch);
+            pts.push([n - n1, e.weight]);
+        if (n < n1 && isNum(e.intake))
+            ins.push(e.intake);
+    }
+    if (span < minSpan || pts.length < MODEL.minWeighIns || ins.length < MODEL.coverage * span)
+        return null;
+    const reg = linreg(pts);
+    const avgIntake = mean(ins);
+    const obs = avgIntake - reg.slope * KCAL_PER_LB;
+    const sigma = reg.sxx > 0 ? (reg.sd / Math.sqrt(reg.sxx)) * MODEL.autocorr * KCAL_PER_LB : null;
+    return { lo, hi, span, nW: pts.length, nI: ins.length, avgIntake, slope: reg.slope, rateWk: -reg.slope * 7, obs, sigma };
+}
+// Simple 14-day trend for display (rate and forecast), separate from the maintenance model.
+function trend14(E, endK) {
+    const pts = [];
+    for (let i = 13; i >= 0; i--) {
+        const k = addDays(endK, -i);
+        const e = E[k];
+        if (e && isNum(e.weight))
+            pts.push([-i, e.weight]);
+    }
+    if (pts.length < 5)
+        return null;
+    const reg = linreg(pts);
+    return { rateWk: -reg.slope * 7, now: reg.at(0) };
+}
+// One day's burn according to the watch, on the same footing as the scale's number.
+function watchBurn(E, k, s, fallbackIntake) {
+    const e = E[k];
+    if (!e || !isNum(e.active))
+        return null;
+    const bw = avg7(E, k) ?? (isNum(e.weight) ? e.weight : null);
+    if (bw == null)
+        return null;
+    const bmr = mifflin(bw, s);
+    const rest = isNum(e.resting) ? e.resting + (bmr / 24) * s.sleepHours : bmr;
+    const food = isNum(e.intake) ? e.intake : (fallbackIntake ?? 0);
+    return { burn: e.active + rest + MODEL.tef * food, usedFormulaRest: !isNum(e.resting) };
+}
+function watchModel(E, k, s, scaleMeas) {
+    const washEnd = addDays(s.cutStart, MODEL.washoutDays);
+    const lo = maxKey(washEnd, addDays(k, -MODEL.calibDays));
+    const res = { nCal: 0, calibrated: false, active: false };
+    if (lo >= k)
+        return res;
+    const ints = [];
+    for (let d = lo; d < k; d = addDays(d, 1)) {
+        const e = E[d];
+        if (e && isNum(e.intake))
+            ints.push(e.intake);
+    }
+    const fallback = ints.length ? mean(ints) : null;
+    const burns = [];
+    let formulaRest = 0;
+    for (let d = lo; d < k; d = addDays(d, 1)) {
+        const b = watchBurn(E, d, s, fallback);
+        if (b) {
+            burns.push({ d, b: b.burn });
+            if (b.usedFormulaRest)
+                formulaRest++;
         }
     }
-    const reg = ws.length >= 5 ? linreg(ws) : null;
-    const avgIntake = intakes.length ? mean(intakes) : null;
-    const slope = reg ? reg.slope : null;
-    const scaleBurn = reg && intakes.length >= 5 ? avgIntake - slope * KCAL_PER_LB : null;
-    return {
-        nW: ws.length, nI: intakes.length, nWatch: watches.length,
-        avgIntake, avgWatch: watches.length ? mean(watches) : null,
-        slope, rateWk: slope != null ? -slope * 7 : null,
-        trendNow: reg ? reg.at(0) : null, scaleBurn,
-    };
+    res.nCal = burns.length;
+    res.formulaRestDays = formulaRest;
+    if (!burns.length)
+        return res;
+    res.from = burns[0].d;
+    res.meanBurn = mean(burns.map((x) => x.b));
+    const m = measure(E, burns[0].d, k, 7);
+    res.meas = m;
+    if (m) {
+        res.ratio = res.meanBurn / m.obs;
+        res.ratioSigma = m.sigma ? (res.meanBurn * m.sigma) / (m.obs * m.obs) : null;
+    }
+    const span = dayNum(k) - dayNum(lo);
+    res.calibrated = !!m && burns.length >= MODEL.calibMinWatch && span >= MODEL.calibDays - 1;
+    if (res.calibrated && scaleMeas) {
+        res.c = m.obs / res.meanBurn;
+        const recent = burns.filter((x) => x.d >= addDays(k, -7)).map((x) => x.b);
+        const inWindow = burns.filter((x) => x.d >= scaleMeas.lo).map((x) => x.b);
+        if (recent.length >= 5 && inWindow.length >= MODEL.coverage * scaleMeas.span) {
+            const base = mean(inWindow), now = mean(recent);
+            res.change = now / base - 1;
+            res.shift = clamp(res.c * (now - base), -MODEL.watchCap, MODEL.watchCap);
+            res.flag = Math.abs(res.change) > MODEL.watchFlag;
+            res.active = true;
+        }
+    }
+    return res;
 }
-// Maintenance estimate: blend the formula with what the scale says, trusting the scale more as the cut matures.
-function estimate(data, endK) {
-    const s = data.settings;
-    const startK = addDays(endK, -13);
-    const w = windowStats(data.entries, startK, endK);
-    const lastK = latestWeightKey(data.entries, endK);
-    const cur = w.trendNow ?? avg7(data.entries, endK) ?? (lastK ? data.entries[lastK].weight : null);
-    if (cur == null)
-        return null;
-    const formula = mifflin(cur, s) * s.activity;
-    const daysIn = dayNum(endK) - dayNum(s.cutStart);
-    const washout = clamp((daysIn - 7) / 21, 0, 1); // early water loss fades out over weeks 1 to 4
-    const coverage = clamp(w.nI / 13, 0, 1);
-    const trust = w.scaleBurn != null ? 0.9 * washout * coverage : 0;
-    const tdee = w.scaleBurn != null ? trust * w.scaleBurn + (1 - trust) * formula : formula;
-    return { ...w, startK, endK, cur, formula, daysIn, trust, tdee };
-}
-function recommend(est, s) {
-    return Math.max(s.calorieFloor, round50(est.tdee - (s.goalRate * KCAL_PER_LB) / 7));
-}
-function basisOf(est, s) {
-    return {
-        startK: est.startK, endK: est.endK, avgIntake: est.avgIntake, nI: est.nI,
-        rateWk: est.rateWk, scaleBurn: est.scaleBurn, formula: est.formula,
-        trust: est.trust, tdee: est.tdee, goalRate: s.goalRate,
-        deficit: (s.goalRate * KCAL_PER_LB) / 7,
-    };
-}
-function lockWeek(data, ws, endK) {
-    if (!endK)
-        return data;
-    const est = estimate(data, endK);
-    if (!est)
-        return data;
-    const target = recommend(est, data.settings);
-    return { ...data, weeks: { ...data.weeks, [ws]: { target, setOn: endK, basis: basisOf(est, data.settings) } } };
-}
-// Lock this week's target once the first weigh-in of the week exists.
-function ensureWeek(data, today) {
-    const ws = weekStart(today);
-    if (data.weeks[ws])
-        return data;
-    const ks = Object.keys(data.entries).filter((k) => k >= ws && k <= today && isNum(data.entries[k].weight)).sort();
-    return ks.length ? lockWeek(data, ws, ks[0]) : data;
-}
-function forecastLine(x0, w0, rateWk, stopAt, maxWeeks = 60) {
-    if (!(rateWk > 0.05) || w0 <= stopAt)
-        return [];
-    const perDay = rateWk / 7;
-    const total = Math.min((w0 - stopAt) / perDay, maxWeeks * 7);
-    const out = [{ x: x0, y: w0 }];
-    for (let d = 7; d < total; d += 7)
-        out.push({ x: x0 + d, y: w0 - perDay * d });
-    out.push({ x: x0 + total, y: w0 - perDay * total });
-    return out;
+// Replays every day from the cut start. Same inputs always give the same numbers.
+function runModel(data, today) {
+    const s = data.settings, E = data.entries;
+    const days = [];
+    if (!isKey(s.cutStart) || s.cutStart > today)
+        return days;
+    const washEnd = addDays(s.cutStart, MODEL.washoutDays);
+    let est = null, wPrev = null, target = null, weekTarget = null, weekKey = null;
+    for (let k = s.cutStart; k <= today; k = addDays(k, 1)) {
+        const a = avg7(E, k);
+        const row = { k, avg7: a };
+        if (est == null) {
+            if (a == null) {
+                days.push(row);
+                continue;
+            }
+            est = mifflin(a, s) * s.activity;
+            wPrev = a;
+            row.init = true;
+        }
+        row.prev = est;
+        if (a != null) {
+            row.weightAdj = perLb(s) * (a - wPrev);
+            est += row.weightAdj;
+            wPrev = a;
+        }
+        row.formula = mifflin(wPrev, s) * s.activity;
+        if (k >= addDays(washEnd, MODEL.minSpan)) {
+            const lo = maxKey(washEnd, addDays(k, -(MODEL.windowDays - 1)));
+            const m = measure(E, lo, k);
+            if (m) {
+                row.meas = m;
+                row.gap = clamp(m.obs - est, -MODEL.clamp, MODEL.clamp);
+                row.nudge = DAILY_GAIN * row.gap;
+                est += row.nudge;
+            }
+        }
+        row.est = est;
+        row.watch = watchModel(E, k, s, row.meas);
+        row.shift = row.watch.active ? row.watch.shift : 0;
+        row.maint = est + row.shift;
+        row.raw = Math.max(s.calorieFloor, round50(row.maint - (s.goalRate * KCAL_PER_LB) / 7));
+        if (s.targetMode === "weekly") {
+            const ws = weekStart(k);
+            if (ws !== weekKey) {
+                weekTarget = weekTarget == null ? row.raw : clamp(row.raw, weekTarget - MODEL.weeklyCap, weekTarget + MODEL.weeklyCap);
+                weekKey = ws;
+                row.setsWeek = true;
+            }
+            row.target = weekTarget;
+        }
+        else {
+            target = target == null ? row.raw : clamp(row.raw, target - MODEL.dailyCap, target + MODEL.dailyCap);
+            row.target = target;
+        }
+        row.capped = s.targetMode === "weekly" ? !!row.setsWeek && row.target !== row.raw : row.target !== row.raw;
+        days.push(row);
+    }
+    return days;
 }
 function derive(data, today) {
-    const s = data.settings;
-    const pts = weightPts(data.entries, today);
+    const s = data.settings, E = data.entries;
+    const rows = runModel(data, today);
+    const byKey = {};
+    rows.forEach((r) => { byKey[r.k] = r; });
+    const pts = weightPts(E, today);
     const last = pts[pts.length - 1] || null;
     const prev = pts[pts.length - 2] || null;
-    const est = last ? estimate(data, last.k) : null;
-    const avgNow = last ? avg7(data.entries, last.k) : null;
-    const avgWeekAgo = last ? avg7(data.entries, addDays(last.k, -7)) : null;
-    const ws = weekStart(today);
-    const we = addDays(ws, 6);
-    const locked = data.weeks[ws] || null;
-    const provisional = !locked && est ? recommend(est, s) : null;
-    const target = locked ? locked.target : provisional;
-    const wkIntake = [];
-    for (let k = ws; k < today; k = addDays(k, 1)) {
-        const e = data.entries[k];
+    const row = byKey[today] && isNum(byKey[today].est) ? byKey[today] : null;
+    const checkedIn = !!(E[today] && isNum(E[today].weight));
+    const avgNow = last ? avg7(E, last.k) : null;
+    const avgWeekAgo = last ? avg7(E, addDays(last.k, -7)) : null;
+    const t14 = last ? trend14(E, last.k) : null;
+    const daysIn = dayNum(today) - dayNum(s.cutStart);
+    const last7 = [], prot7 = [];
+    for (let i = 1; i <= 7; i++) {
+        const e = E[addDays(today, -i)];
         if (e && isNum(e.intake))
-            wkIntake.push(e.intake);
+            last7.push(e.intake);
+        if (e && isNum(e.protein))
+            prot7.push(e.protein);
     }
-    return { s, pts, last, prev, est, avgNow, avgWeekAgo, ws, we, locked, provisional, target, wkIntake };
+    return { s, rows, byKey, row, pts, last, prev, checkedIn, avgNow, avgWeekAgo, t14, daysIn, last7, prot7 };
 }
-function rateStatus(est, s) {
-    if (!est || est.rateWk == null)
+function rateStatus(der) {
+    const { t14, s, daysIn } = der;
+    if (!t14)
         return null;
-    const r = est.rateWk;
-    const early = est.daysIn < 21;
+    const r = t14.rateWk;
     if (r > s.maxRate) {
-        return early
-            ? { tone: "muted", text: `Faster than your ${s.maxRate} lb/week cap, but the first few weeks include water loss. The target adjusts on its own once that washes out.` }
-            : { tone: "warn", text: `Faster than your ${s.maxRate} lb/week cap. Next week's target will come up to slow it down.` };
+        return daysIn < 21
+            ? { tone: "muted", text: `Faster than your ${s.maxRate} lb/week cap, but the first weeks of a cut are mostly water.` }
+            : { tone: "warn", text: `Faster than your ${s.maxRate} lb/week cap. The target comes up on its own as the estimate catches it.` };
     }
     if (r >= s.minRate)
         return { tone: "good", text: `Inside your ${s.minRate}–${s.maxRate} lb/week range.` };
     if (r > 0)
-        return { tone: "muted", text: `Slower than ${s.minRate} lb/week. Next week's target will come down if this holds.` };
-    return { tone: "warn", text: "The trend isn't heading down. Check that logging has been complete." };
+        return { tone: "muted", text: `Slower than ${s.minRate} lb/week over two weeks. Short stretches like this are often water.` };
+    return { tone: "warn", text: "The two-week trend isn't heading down. Check that logging has been complete." };
 }
 function buildRead(der, today) {
-    const { last, prev, avgNow, avgWeekAgo, est } = der;
+    const { last, prev, avgNow, avgWeekAgo, t14, row } = der;
     if (!last)
         return "Log your first weigh-in to get a read.";
     const parts = [];
@@ -230,41 +361,92 @@ function buildRead(der, today) {
     if (avgNow != null) {
         if (avgWeekAgo != null) {
             const c = avgNow - avgWeekAgo;
-            const change = Math.abs(c) < 0.05 ? "unchanged" : `${c < 0 ? "down" : "up"} ${fmt1(Math.abs(c))}`;
-            parts.push(`Your 7-day average is ${fmt1(avgNow)}, ${change} from a week ago.`);
+            parts.push(`Your 7-day average is ${fmt1(avgNow)}, ${Math.abs(c) < 0.05 ? "unchanged" : `${c < 0 ? "down" : "up"} ${fmt1(Math.abs(c))}`} from a week ago.`);
         }
-        else {
+        else
             parts.push(`Your 7-day average is ${fmt1(avgNow)}.`);
-        }
     }
-    if (est && est.rateWk != null) {
-        parts.push(est.rateWk >= 0
-            ? `The two-week trend has you losing ${fmt1(est.rateWk)} lb/week.`
-            : `The two-week trend has you gaining ${fmt1(-est.rateWk)} lb/week.`);
+    if (t14)
+        parts.push(t14.rateWk >= 0 ? `The two-week trend has you losing ${fmt1(t14.rateWk)} lb/week.` : `The two-week trend has you gaining ${fmt1(-t14.rateWk)} lb/week.`);
+    if (row && row.watch && row.watch.flag) {
+        const ch = row.watch.change;
+        parts.push(`Your watch shows this week's activity ${Math.round(Math.abs(ch) * 100)}% ${ch > 0 ? "above" : "below"} your recent normal, so maintenance is shifted ${fmtSigned(row.shift)}.`);
     }
     return parts.join(" ");
 }
 function weekRows(data, der, today) {
-    const out = [];
+    const E = data.entries, out = [];
     const first = weekStart(data.settings.cutStart);
-    for (let ws = der.ws; ws >= first; ws = addDays(ws, -7)) {
+    for (let ws = weekStart(today); ws >= first; ws = addDays(ws, -7)) {
         const we = addDays(ws, 6);
-        const ints = [];
-        for (let k = ws; k <= we && k < today; k = addDays(k, 1)) {
-            const e = data.entries[k];
-            if (e && isNum(e.intake))
+        const ints = [], gv = [];
+        for (let k = ws; k <= we && k <= today; k = addDays(k, 1)) {
+            const e = E[k];
+            if (k < today && e && isNum(e.intake))
                 ints.push(e.intake);
+            const g = data.given[k] ?? (k === today && der.byKey[k] ? der.byKey[k].target : null);
+            if (isNum(g))
+                gv.push(g);
         }
         const endK = we < today ? we : today;
-        const a1 = avg7(data.entries, endK);
-        const a0 = avg7(data.entries, addDays(ws, -1));
-        out.push({
-            ws, target: data.weeks[ws]?.target ?? null,
-            avg: ints.length ? mean(ints) : null, n: ints.length,
-            change: a1 != null && a0 != null ? a1 - a0 : null,
-        });
+        const a1 = avg7(E, endK), a0 = avg7(E, addDays(ws, -1));
+        out.push({ ws, target: gv.length ? mean(gv) : null, avg: ints.length ? mean(ints) : null, n: ints.length, change: a1 != null && a0 != null ? a1 - a0 : null });
     }
     return out;
+}
+function forecastLine(x0, w0, rateWk, stopAt, maxWeeks = 60) {
+    if (!(rateWk > 0.05) || w0 <= stopAt)
+        return [];
+    const perDay = rateWk / 7;
+    const total = Math.min((w0 - stopAt) / perDay, maxWeeks * 7);
+    const out = [{ x: x0, y: w0 }];
+    for (let d = 7; d < total; d += 7)
+        out.push({ x: x0 + d, y: w0 - perDay * d });
+    out.push({ x: x0 + total, y: w0 - perDay * total });
+    return out;
+}
+/* ---------- export ---------- */
+function toCSV(data, der) {
+    const E = data.entries;
+    const keys = Object.keys(E).sort();
+    const head = ["date", "weight_lb", "weight_7day_avg", "calories", "protein_g", "watch_active", "watch_resting", "water_bottles", "maintenance_estimate", "target_given", "target_model"];
+    const lines = [head.join(",")];
+    for (const k of keys) {
+        const e = E[k], r = der.byKey[k];
+        const a = avg7(E, k);
+        const g = data.given[k];
+        const v = [k, e.weight, a != null ? fmt1(a) : "", e.intake, e.protein, e.active, e.resting, e.water, r && isNum(r.maint) ? Math.round(r.maint) : "", isNum(g) ? g : "", r && isNum(r.target) ? r.target : ""];
+        lines.push(v.map((x) => (x == null ? "" : String(x))).join(","));
+    }
+    return lines.join("\n") + "\n";
+}
+async function shareFile(filename, text, mime) {
+    try {
+        const file = new File([text], filename, { type: mime });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+            await navigator.share({ files: [file], title: filename });
+            return "shared";
+        }
+    }
+    catch (e) {
+        if (e && e.name === "AbortError")
+            return "cancelled";
+    }
+    try {
+        const blob = new Blob([text], { type: mime });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+        return "downloaded";
+    }
+    catch (e) {
+        return "failed";
+    }
 }
 /* ---------- hooks ---------- */
 function usePrefersDark() {
@@ -333,7 +515,9 @@ const CSS = `
 .btn.ghost{background:transparent;color:var(--accent);border:1.5px solid var(--accent)}
 .btn.sm{width:auto;font-size:14px;padding:8px 12px}
 .btn.danger{background:transparent;color:var(--warn);border:1.5px solid var(--warn)}
+.btn:disabled{opacity:.45}
 .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+a.btn{display:inline-block;text-decoration:none;text-align:center}
 .link{appearance:none;background:none;border:0;padding:0;font:inherit;font-size:14px;color:var(--accent);text-decoration:underline;text-underline-offset:3px;cursor:pointer;margin-top:8px}
 .note{font-size:14px;color:var(--muted)}
 .ct .ok{font-size:14px;color:var(--good);margin-top:10px}
@@ -341,6 +525,9 @@ const CSS = `
 .ct .status{font-size:15px;margin-top:8px}
 .status.warn{color:var(--warn)} .status.good{color:var(--good)} .status.muted{color:var(--muted)}
 .basis{font-size:14px;color:var(--muted);margin-top:10px;padding-left:12px;border-left:3px solid var(--line)}
+.basis ol{margin:6px 0 0;padding-left:20px}
+.basis li{margin:6px 0}
+.basis b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
 .seg{display:inline-flex;background:var(--surface);border-radius:10px;padding:3px;margin-bottom:10px}
 .seg button{appearance:none;border:0;background:none;font:inherit;font-size:14px;color:var(--muted);padding:7px 14px;border-radius:8px;cursor:pointer}
 .seg button[aria-pressed="true"]{background:var(--accent);color:var(--on-accent);font-weight:600}
@@ -348,14 +535,14 @@ const CSS = `
 .sw{display:inline-block;width:16px;height:0;border-top:2.5px solid;vertical-align:middle;margin-right:6px}
 .sw.dot{width:7px;height:7px;border:0;border-radius:50%;margin-right:6px}
 .sw.band{height:9px;border:0;border-radius:2px;margin-right:6px}
-.eta{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:6px}
+.eta{display:grid;grid-template-columns:1fr 1fr;gap:14px 12px;margin-top:6px}
 .eta-v{font-family:var(--display);font-weight:600;font-size:24px;line-height:1.05;font-variant-numeric:tabular-nums}
 .eta-l{font-size:13px;color:var(--muted)}
 .tbl{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;font-size:15px}
 .tbl th{text-align:left;font-weight:500;font-size:13px;color:var(--muted);padding:6px 4px;border-bottom:1px solid var(--line)}
 .tbl td{padding:9px 4px;border-bottom:1px solid var(--line)}
 .tbl .r{text-align:right}
-.hist-row{display:grid;grid-template-columns:1.3fr 1fr 1fr 1fr auto;align-items:center;gap:6px;padding:10px 0;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums;font-size:15px}
+.hist-row{display:grid;grid-template-columns:1.35fr 1fr 1fr 1fr auto;align-items:center;gap:6px;padding:10px 0;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums;font-size:15px}
 .hist-head{font-size:13px;color:var(--muted);padding:6px 0}
 .hist-edit{padding:12px 0;border-bottom:1px solid var(--line)}
 .dim{color:var(--muted)}
@@ -364,6 +551,9 @@ const CSS = `
 .filebtn{display:inline-block;position:relative;overflow:hidden;text-align:center}
 .filebtn input{position:absolute;inset:0;opacity:0;cursor:pointer;font-size:0}
 textarea.input{font-size:12px;min-height:120px;font-family:ui-monospace,Menlo,monospace}
+.stepper{display:flex;align-items:center;gap:10px}
+.stepper button{appearance:none;width:46px;height:46px;border-radius:10px;border:1.5px solid var(--line);background:var(--bg);color:var(--ink);font:inherit;font-size:22px;cursor:pointer}
+.stepper .count{font-family:var(--display);font-weight:600;font-size:26px;min-width:28px;text-align:center;font-variant-numeric:tabular-nums}
 @media (max-width:380px){ .hero-num{font-size:88px} .stat-v{font-size:23px} }
 `;
 /* ---------- small components ---------- */
@@ -372,96 +562,238 @@ function Stat({ v, l }) {
         React.createElement("div", { className: "stat-v" }, v),
         React.createElement("div", { className: "stat-l" }, l)));
 }
-function Basis({ b, target }) {
-    if (!b)
+function Breakdown({ r, s, prevTarget }) {
+    if (!r || !isNum(r.est))
         return null;
+    const w = r.watch || {};
+    const deficit = (s.goalRate * KCAL_PER_LB) / 7;
     return (React.createElement("div", { className: "basis" },
-        React.createElement("p", null,
-            "Window ",
-            fmtDay(b.startK),
-            " to ",
-            fmtDay(b.endK),
-            ".",
-            " ",
-            b.avgIntake != null && b.rateWk != null
+        React.createElement("ol", null,
+            React.createElement("li", null, r.init
                 ? React.createElement(React.Fragment, null,
-                    "You averaged ",
-                    fmtInt(b.avgIntake),
-                    " kcal over ",
-                    b.nI,
-                    " logged days while the scale trended ",
-                    b.rateWk >= 0 ? "down" : "up",
-                    " ",
-                    fmt1(Math.abs(b.rateWk)),
-                    " lb/week",
-                    b.scaleBurn != null ? React.createElement(React.Fragment, null,
-                        ", which implies a burn of ",
-                        fmtInt(b.scaleBurn)) : null,
+                    "Starting point from the formula: Mifflin\u2013St Jeor \u00D7 ",
+                    s.activity,
+                    " at your 7-day average of ",
+                    fmt1(r.avg7),
+                    " lb = ",
+                    React.createElement("b", null, fmtInt(r.prev)),
                     ".")
-                : React.createElement(React.Fragment, null, "Not enough logged days yet to use the scale.")),
-        React.createElement("p", null,
-            "The formula estimate is ",
-            fmtInt(b.formula),
-            ". The scale got ",
-            Math.round(b.trust * 100),
-            "% of the weight (it earns more trust as the cut matures and logging fills in), giving maintenance of ",
-            fmtInt(b.tdee),
-            ". Subtract ",
-            fmtInt(b.deficit),
-            " for ",
-            b.goalRate,
-            " lb/week and round: ",
-            fmtInt(target),
-            ".")));
+                : React.createElement(React.Fragment, null,
+                    "Yesterday's maintenance estimate: ",
+                    React.createElement("b", null, fmtInt(r.prev)),
+                    ".")),
+            isNum(r.weightAdj) && Math.abs(r.weightAdj) >= 0.5 && (React.createElement("li", null,
+                "Weight change: your 7-day average moved, and the formula drops ",
+                fmt1(perLb(s)),
+                " kcal per lb, so ",
+                React.createElement("b", null, fmtSigned(r.weightAdj)),
+                ".")),
+            React.createElement("li", null, r.meas
+                ? React.createElement(React.Fragment, null,
+                    "Scale measurement, ",
+                    fmtDay(r.meas.lo),
+                    " to ",
+                    fmtDay(r.meas.hi),
+                    " (",
+                    r.meas.span,
+                    " days): you averaged ",
+                    fmtInt(r.meas.avgIntake),
+                    " kcal while trending ",
+                    r.meas.rateWk >= 0 ? "down" : "up",
+                    " ",
+                    Math.abs(r.meas.rateWk).toFixed(2),
+                    " lb/week, so maintenance measured ",
+                    React.createElement("b", null,
+                        fmtInt(r.meas.obs),
+                        " \u00B1 ",
+                        fmtInt(r.meas.sigma)),
+                    ". The estimate moves ",
+                    Math.round(DAILY_GAIN * 100),
+                    "% of the way toward it each morning",
+                    Math.abs(r.meas.obs - r.prev) > MODEL.clamp ? `, with the gap capped at ${MODEL.clamp}` : "",
+                    ": ",
+                    React.createElement("b", null, fmtSigned(r.nudge)),
+                    ".")
+                : r.k < addDays(addDays(s.cutStart, MODEL.washoutDays), MODEL.minSpan)
+                    ? React.createElement(React.Fragment, null,
+                        "No scale measurement yet. The first two weeks of a cut are mostly water, so measuring starts ",
+                        fmtDay(addDays(addDays(s.cutStart, MODEL.washoutDays), MODEL.minSpan)),
+                        ".")
+                    : React.createElement(React.Fragment, null,
+                        "Scale measurement skipped today: it needs ",
+                        MODEL.minWeighIns,
+                        "+ weigh-ins and calories on ",
+                        Math.round(MODEL.coverage * 100),
+                        "% of days in the window.")),
+            React.createElement("li", null, w.active
+                ? React.createElement(React.Fragment, null,
+                    "Watch: your activity over the last week is ",
+                    Math.round(Math.abs(w.change) * 100),
+                    "% ",
+                    w.change >= 0 ? "above" : "below",
+                    " the scale window, worth ",
+                    React.createElement("b", null, fmtSigned(r.shift)),
+                    " (limit \u00B1",
+                    MODEL.watchCap,
+                    ").")
+                : w.calibrated
+                    ? React.createElement(React.Fragment, null, "Watch: calibrated, but it needs 5 of the last 7 days logged to vote. No change.")
+                    : React.createElement(React.Fragment, null,
+                        "Watch: still calibrating (",
+                        w.nCal || 0,
+                        " of ",
+                        MODEL.calibMinWatch,
+                        " days), so it doesn't affect the number yet.")),
+            React.createElement("li", null,
+                "Maintenance ",
+                React.createElement("b", null, fmtInt(r.maint)),
+                " minus ",
+                fmtInt(deficit),
+                " for ",
+                s.goalRate,
+                " lb/week, rounded to 50 = ",
+                React.createElement("b", null, fmtInt(r.raw)),
+                ".",
+                r.capped && isNum(prevTarget) && React.createElement(React.Fragment, null,
+                    " That's more than ",
+                    s.targetMode === "weekly" ? MODEL.weeklyCap : MODEL.dailyCap,
+                    " from ",
+                    s.targetMode === "weekly" ? "last week's" : "yesterday's",
+                    " ",
+                    fmtInt(prevTarget),
+                    ", so today's target is held at ",
+                    React.createElement("b", null, fmtInt(r.target)),
+                    ".")))));
 }
 /* ---------- check-in form ---------- */
+const FIELDS = [
+    { key: "weight", label: "Weight this morning (lb)", ph: "208.4", dec: true, min: 80, max: 500 },
+    { key: "intake", label: "Calories", ph: "2700", min: 0, max: 12000, prev: true },
+    { key: "protein", label: "Protein (g)", ph: "190", min: 0, max: 600, prev: true },
+    { key: "active", label: "Watch active", ph: "1100", min: 0, max: 8000, prev: true },
+    { key: "resting", label: "Watch resting", ph: "1400", min: 0, max: 5000, prev: true },
+];
+function cleanVal(v, f) {
+    const n = parseNum(v);
+    if (n == null)
+        return { v: null };
+    if (Number.isNaN(n) || n < f.min || n > f.max)
+        return { err: true };
+    return { v: f.dec ? Math.round(n * 10) / 10 : Math.round(n) };
+}
+// Reads what the Health Shortcut copied, e.g. "cal=2712&protein=188&active=1104&resting=1402".
+function parseHandoff(text) {
+    const map = { w: "weight", weight: "weight", cal: "intake", calories: "intake", protein: "protein", active: "active", resting: "resting", water: "water" };
+    const out = {};
+    const re = /([a-z]+)\s*[=:]\s*([0-9][0-9.,]*)/gi;
+    let m;
+    while ((m = re.exec(String(text || "")))) {
+        const k = map[m[1].toLowerCase()];
+        if (k)
+            out[k] = m[2];
+    }
+    return Object.keys(out).length ? out : null;
+}
 function CheckIn({ data, today, onSave, prefill, onPrefillUsed }) {
-    const preDate = prefill?.date && /^\d{4}-\d{2}-\d{2}$/.test(prefill.date) && prefill.date <= today ? prefill.date : null;
+    const preDate = prefill && isKey(prefill.date) && prefill.date <= today ? prefill.date : null;
     const [date, setDate] = useState(preDate || today);
-    const [w, setW] = useState("");
-    const [cal, setCal] = useState("");
-    const [watch, setWatch] = useState("");
+    const [vals, setVals] = useState({});
+    const [water, setWater] = useState(null);
     const [msg, setMsg] = useState(null);
     const prevK = addDays(date, -1);
+    const bottleOz = data.settings.bottleOz || 24;
+    const collect = (v, wt) => {
+        const out = {};
+        for (const f of FIELDS) {
+            const c = cleanVal(v[f.key], f);
+            if (c.err)
+                return { error: `${f.label.replace(" (lb)", "").replace(" (g)", "")} doesn't look right.` };
+            if (c.v != null)
+                out[f.key] = c.v;
+        }
+        if (wt != null)
+            out.water = wt;
+        if (!Object.keys(out).length)
+            return { error: "Enter at least one value to save." };
+        return { out };
+    };
     useEffect(() => {
         const e = data.entries[date] || {};
         const p = data.entries[addDays(date, -1)] || {};
-        let wv = isNum(e.weight) ? String(e.weight) : "";
-        let cv = isNum(p.intake) ? String(p.intake) : "";
-        let xv = isNum(p.watch) ? String(p.watch) : "";
+        const v = {};
+        for (const f of FIELDS) {
+            const src = f.prev ? p : e;
+            v[f.key] = isNum(src[f.key]) ? String(src[f.key]) : "";
+        }
+        let wt = isNum(p.water) ? p.water : null;
         let m = null;
         if (prefill) {
-            const clean = (v, dec) => { const n = parseNum(v); return n == null || Number.isNaN(n) ? null : String(dec ? Math.round(n * 10) / 10 : Math.round(n)); };
-            const a = clean(prefill.w, true), b = clean(prefill.cal, false), c = clean(prefill.watch, false);
-            if (a)
-                wv = a;
-            if (b)
-                cv = b;
-            if (c)
-                xv = c;
-            if (a || b || c)
+            const map = { w: "weight", cal: "intake", protein: "protein", active: "active", resting: "resting" };
+            let any = false;
+            for (const [q, f] of Object.entries(map)) {
+                if (prefill[q] == null)
+                    continue;
+                const fd = FIELDS.find((x) => x.key === f);
+                const c = cleanVal(prefill[q], fd);
+                if (c.v != null) {
+                    v[f] = String(c.v);
+                    any = true;
+                }
+            }
+            const pw = parseNum(prefill.water);
+            if (pw != null && !Number.isNaN(pw) && pw >= 0 && pw < 40) {
+                wt = Math.round(pw * 2) / 2;
+                any = true;
+            }
+            if (any) {
                 m = { err: false, t: "Filled in from your Shortcut. Check the numbers, then save." };
+                if (prefill.save === "1") {
+                    const r = collect(v, wt);
+                    if (r.out && isNum(r.out.weight)) {
+                        onSave(date, r.out);
+                        m = { err: false, t: `Saved from your Shortcut for ${fmtDay(date)}. Edit and save again if anything's off.` };
+                    }
+                }
+            }
             onPrefillUsed && onPrefillUsed();
         }
-        setW(wv);
-        setCal(cv);
-        setWatch(xv);
+        setVals(v);
+        setWater(wt);
         setMsg(m);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [date]);
     const exists = isNum((data.entries[date] || {}).weight);
     const submit = () => {
-        const wv = parseNum(w), cv = parseNum(cal), xv = parseNum(watch);
-        if (Number.isNaN(wv) || (wv != null && (wv < 80 || wv > 500)))
-            return setMsg({ err: true, t: "Weight should be a number in lb, like 211.8." });
-        if (Number.isNaN(cv) || (cv != null && (cv < 0 || cv > 12000)))
-            return setMsg({ err: true, t: "Calories should be a whole number, like 2550." });
-        if (Number.isNaN(xv) || (xv != null && (xv < 0 || xv > 12000)))
-            return setMsg({ err: true, t: "Watch total should be a whole number, like 3100." });
-        if (wv == null && cv == null && xv == null)
-            return setMsg({ err: true, t: "Enter at least one value to save." });
-        onSave(date, wv == null ? null : Math.round(wv * 10) / 10, cv == null ? null : Math.round(cv), xv == null ? null : Math.round(xv));
+        const r = collect(vals, water);
+        if (r.error)
+            return setMsg({ err: true, t: r.error });
+        onSave(date, r.out);
         setMsg({ err: false, t: `Saved check-in for ${fmtDay(date)}.` });
+    };
+    const set = (k) => (e) => setVals({ ...vals, [k]: e.target.value });
+    const shortcutName = data.settings.shortcutName || "Cut check-in";
+    const pasteHealth = async () => {
+        try {
+            const q = parseHandoff(await navigator.clipboard.readText());
+            if (!q)
+                return setMsg({ err: true, t: "The clipboard doesn't have numbers from the Shortcut. Run it, then tap Paste from Health again." });
+            const v = { ...vals };
+            for (const f of FIELDS) {
+                if (q[f.key] == null)
+                    continue;
+                const c = cleanVal(q[f.key], f);
+                if (c.v != null)
+                    v[f.key] = String(c.v);
+            }
+            setVals(v);
+            const pw = parseNum(q.water);
+            if (pw != null && !Number.isNaN(pw))
+                setWater(Math.round(pw * 2) / 2);
+            setMsg({ err: false, t: v.weight ? "Filled in from Health. Check the numbers, then save." : "Filled in from Health. Add your weight, then save." });
+        }
+        catch {
+            setMsg({ err: true, t: "Couldn't read the clipboard. Tap Paste when iOS asks, or type the numbers in." });
+        }
     };
     return (React.createElement("section", { className: "sec" },
         React.createElement("h2", null, "Morning check-in"),
@@ -469,87 +801,93 @@ function CheckIn({ data, today, onSave, prefill, onPrefillUsed }) {
             React.createElement("label", { className: "field" },
                 React.createElement("span", null, "Date"),
                 React.createElement("input", { className: "input sm", type: "date", value: date, max: today, onChange: (e) => e.target.value && setDate(e.target.value) })),
+            React.createElement("div", { className: "btns", style: { marginTop: -4, marginBottom: 14 } },
+                React.createElement("a", { className: "btn ghost sm", href: `shortcuts://run-shortcut?name=${encodeURIComponent(shortcutName)}` }, "Run Health Shortcut"),
+                React.createElement("button", { className: "btn ghost sm", onClick: pasteHealth }, "Paste from Health")),
             React.createElement("label", { className: "field" },
                 React.createElement("span", null, "Weight this morning (lb)"),
-                React.createElement("input", { className: "input", inputMode: "decimal", placeholder: "211.8", value: w, onChange: (e) => setW(e.target.value) })),
+                React.createElement("input", { className: "input", inputMode: "decimal", placeholder: "208.4", value: vals.weight || "", onChange: set("weight") })),
+            React.createElement("p", { className: "note", style: { margin: "2px 0 10px" } },
+                "Everything below is for ",
+                fmtDayLong(prevK),
+                "."),
             React.createElement("div", { className: "row2" },
                 React.createElement("label", { className: "field" },
-                    React.createElement("span", null,
-                        "Calories eaten ",
-                        fmtDay(prevK)),
-                    React.createElement("input", { className: "input", inputMode: "numeric", placeholder: "2550", value: cal, onChange: (e) => setCal(e.target.value) })),
+                    React.createElement("span", null, "Calories"),
+                    React.createElement("input", { className: "input", inputMode: "numeric", placeholder: "2700", value: vals.intake || "", onChange: set("intake") })),
                 React.createElement("label", { className: "field" },
-                    React.createElement("span", null,
-                        "Watch total ",
-                        fmtDay(prevK)),
-                    React.createElement("input", { className: "input", inputMode: "numeric", placeholder: "3100", value: watch, onChange: (e) => setWatch(e.target.value) }))),
-            React.createElement("p", { className: "note", style: { marginTop: -4, marginBottom: 12 } }, "Watch total means active plus resting energy."),
+                    React.createElement("span", null, "Protein (g)"),
+                    React.createElement("input", { className: "input", inputMode: "numeric", placeholder: "190", value: vals.protein || "", onChange: set("protein") })),
+                React.createElement("label", { className: "field" },
+                    React.createElement("span", null, "Watch active"),
+                    React.createElement("input", { className: "input", inputMode: "numeric", placeholder: "1100", value: vals.active || "", onChange: set("active") })),
+                React.createElement("label", { className: "field" },
+                    React.createElement("span", null, "Watch resting"),
+                    React.createElement("input", { className: "input", inputMode: "numeric", placeholder: "optional", value: vals.resting || "", onChange: set("resting") }))),
+            React.createElement("div", { className: "field" },
+                React.createElement("span", { style: { display: "block", fontSize: 14, color: "var(--muted)", marginBottom: 5 } },
+                    "Water bottles (",
+                    bottleOz,
+                    " oz)"),
+                React.createElement("div", { className: "stepper" },
+                    React.createElement("button", { "aria-label": "One fewer bottle", onClick: () => setWater(Math.max(0, (water || 0) - 1)) }, "\u2212"),
+                    React.createElement("span", { className: "count" }, water == null ? "–" : water),
+                    React.createElement("button", { "aria-label": "One more bottle", onClick: () => setWater((water || 0) + 1) }, "+"),
+                    water != null && React.createElement("span", { className: "note" },
+                        fmtInt(water * bottleOz),
+                        " oz"))),
+            React.createElement("p", { className: "note", style: { marginBottom: 12 } }, "Active and resting are separate lines in the Health app. Resting is optional; without it the app uses the formula."),
             React.createElement("button", { className: "btn", onClick: submit }, exists ? "Update check-in" : "Save check-in"),
             msg && React.createElement("p", { className: msg.err ? "err" : "ok", role: "status" }, msg.t))));
 }
 /* ---------- tabs ---------- */
-function TodayTab({ data, der, today, onSave, onRecalc, prefill, onPrefillUsed, onRestore }) {
+function TodayTab({ data, der, today, onSave, prefill, onPrefillUsed, onRestore }) {
     const s = data.settings;
     const [open, setOpen] = useState(false);
-    const [confirm, setConfirm] = useState(false);
-    const wkAvg = der.wkIntake.length ? mean(der.wkIntake) : null;
-    const status = rateStatus(der.est, s);
-    const suggestion = der.est ? recommend(der.est, s) : null;
-    let diffText = null;
-    if (wkAvg != null && der.target != null) {
-        const d = wkAvg - der.target;
-        diffText = Math.abs(d) < 50 ? "right on target" : d > 0 ? `${fmtInt(d)} over target` : `${fmtInt(-d)} under target`;
-    }
+    const r = der.row;
+    const yesterday = der.byKey[addDays(today, -1)];
+    const prevTarget = s.targetMode === "weekly" ? (der.byKey[addDays(weekStart(today), -1)] || {}).target : (yesterday || {}).target;
+    const status = rateStatus(der);
     const empty = Object.keys(data.entries).length === 0;
+    const target = r ? r.target : null;
+    let when;
+    if (!r)
+        when = "Log a weigh-in to get a target.";
+    else if (s.targetMode === "weekly")
+        when = `Set for ${fmtDay(weekStart(today))} to ${fmtDay(addDays(weekStart(today), 6))}${der.checkedIn || dow(today) !== 6 ? "." : ", final once you log this morning."}`;
+    else
+        when = der.checkedIn ? "Updated with this morning's check-in." : "Provisional until you log this morning.";
     return (React.createElement(React.Fragment, null,
         empty && (React.createElement("section", { className: "sec" },
             React.createElement("div", { className: "panel" },
                 React.createElement("h2", null, "Start here"),
-                React.createElement("p", null, "Moving over from the Claude version? Restore your backup file first so your history and this week's target come with you."),
+                React.createElement("p", null, "Moving over from an earlier version? Restore your backup file first so your history comes with you."),
                 React.createElement("button", { className: "btn ghost", style: { marginTop: 12 }, onClick: onRestore }, "Restore a backup")))),
         React.createElement("section", { className: "hero" },
             React.createElement("p", { className: "hero-label" }, "Eat today"),
             React.createElement("div", { className: "hero-num" },
-                der.target != null ? fmtInt(der.target) : "–",
+                target != null ? fmtInt(target) : "–",
                 React.createElement("span", { className: "hero-unit" }, "kcal")),
             React.createElement("p", null,
                 "Protein ",
                 s.proteinLow,
                 "\u2013",
                 s.proteinHigh,
-                " g.",
-                " ",
-                der.locked ? `Set for ${fmtDay(der.ws)} to ${fmtDay(der.we)}.` : der.target != null ? "Provisional until you log this morning's weight." : "Log a weigh-in to get a target."),
-            wkAvg != null && (React.createElement("p", null,
-                "This week so far: ",
-                fmtInt(wkAvg),
-                " average over ",
-                der.wkIntake.length,
-                " day",
-                der.wkIntake.length === 1 ? "" : "s",
-                ", ",
-                diffText,
+                " g. ",
+                when),
+            r && React.createElement("p", null,
+                "Maintenance estimate ",
+                fmtInt(r.maint),
+                r.meas ? `, scale alone says ${fmtInt(r.meas.obs)} ± ${fmtInt(r.meas.sigma)}` : "",
+                "."),
+            der.last7.length > 0 && (React.createElement("p", null,
+                "Last 7 days you averaged ",
+                fmtInt(mean(der.last7)),
+                " kcal",
+                der.prot7.length ? ` and ${fmtInt(mean(der.prot7))} g protein` : "",
                 ".")),
-            der.target != null && (React.createElement("button", { className: "link", "aria-expanded": open, onClick: () => { setOpen((v) => !v); setConfirm(false); } }, open ? "Hide details" : "How this number was set")),
-            open && (React.createElement("div", null,
-                der.locked?.note && React.createElement("div", { className: "basis" },
-                    React.createElement("p", null, der.locked.note)),
-                der.locked?.basis && React.createElement(Basis, { b: der.locked.basis, target: der.locked.target }),
-                !der.locked && der.est && React.createElement(Basis, { b: basisOf(der.est, s), target: der.provisional }),
-                der.locked && suggestion != null && suggestion !== der.locked.target && (React.createElement("div", { className: "basis" },
-                    React.createElement("p", null,
-                        "Recalculated with today's data and settings, it would be ",
-                        fmtInt(suggestion),
-                        "."),
-                    !confirm
-                        ? React.createElement("button", { className: "btn ghost sm", style: { marginTop: 8 }, onClick: () => setConfirm(true) }, "Recalculate this week")
-                        : React.createElement("div", { className: "btns" },
-                            React.createElement("button", { className: "btn sm", onClick: () => { onRecalc(); setConfirm(false); } },
-                                "Use ",
-                                fmtInt(suggestion)),
-                            React.createElement("button", { className: "btn ghost sm", onClick: () => setConfirm(false) },
-                                "Keep ",
-                                fmtInt(der.locked.target)))))))),
+            r && (React.createElement("button", { className: "link", "aria-expanded": open, onClick: () => setOpen((v) => !v) }, open ? "Hide the math" : "How today's number was set")),
+            open && React.createElement(Breakdown, { r: r, s: s, prevTarget: prevTarget })),
         React.createElement("section", { className: "sec" },
             React.createElement("h2", null, "Today's read"),
             React.createElement("p", null, buildRead(der, today)),
@@ -573,18 +911,27 @@ function ChartTip({ active, payload }) {
             fmt1(r.plan)),
         isNum(r.pace) && React.createElement("div", null,
             "Current pace ",
-            fmt1(r.pace))));
+            fmt1(r.pace)),
+        isNum(r.maint) && React.createElement("div", null,
+            "Maintenance ",
+            fmtInt(r.maint)),
+        isNum(r.target) && React.createElement("div", null,
+            "Target ",
+            fmtInt(r.target)),
+        isNum(r.ate) && React.createElement("div", null,
+            "Ate ",
+            fmtInt(r.ate))));
 }
 function TrendTab({ data, der, today, pal }) {
     const [mode, setMode] = useState("recent");
     const s = data.settings;
-    const { pts, est, last } = der;
+    const { pts, last, t14 } = der;
     if (!last)
         return React.createElement("section", { className: "sec" },
             React.createElement("p", null, "Log a few weigh-ins and your trend shows up here."));
     const x0 = last.x;
-    const w0 = est ? est.cur : last.w;
-    const paceRate = est?.rateWk ?? null;
+    const w0 = t14 ? t14.now : last.w;
+    const paceRate = t14 ? t14.rateWk : null;
     const plan = forecastLine(x0, w0, s.goalRate, s.goalLow);
     const pace = paceRate != null && paceRate > 0.05 ? forecastLine(x0, w0, paceRate, s.goalLow) : [];
     const map = new Map();
@@ -602,15 +949,24 @@ function TrendTab({ data, der, today, pal }) {
     const ys = vis.flatMap((r) => ["weight", "avg", "plan", "pace"].map((k) => r[k]).filter(isNum));
     if (mode === "goal")
         ys.push(s.goalLow, s.goalHigh);
-    const y0 = Math.floor(Math.min(...ys) - 1);
-    const y1 = Math.ceil(Math.max(...ys) + 1);
+    const y0 = Math.floor(Math.min(...ys) - 1), y1 = Math.ceil(Math.max(...ys) + 1);
     const ticks = [0, 1, 2, 3, 4].map((i) => Math.round(d0 + ((d1 - d0) * i) / 4));
     const eta = (rate, goal) => (rate != null && rate > 0.05 && w0 > goal ? keyOf(x0 + (w0 - goal) / (rate / 7)) : null);
     const planHigh = eta(s.goalRate, s.goalHigh), planLow = eta(s.goalRate, s.goalLow);
     const paceHigh = eta(paceRate, s.goalHigh), paceLow = eta(paceRate, s.goalLow);
     const mid = (s.goalLow + s.goalHigh) / 2;
-    const perLb = 10 * 0.453592 * s.activity;
-    const maintAtGoal = est ? est.tdee - (w0 - mid) * perLb : null;
+    const nowRow = der.row;
+    const maintAtGoal = nowRow ? nowRow.est - (w0 - mid) * perLb(s) : null;
+    // maintenance chart
+    const mrows = der.rows.filter((r) => isNum(r.maint)).map((r) => {
+        const e = data.entries[r.k];
+        return { x: dayNum(r.k), maint: r.maint, target: data.given[r.k] ?? r.target, ate: e && isNum(e.intake) ? e.intake : undefined };
+    });
+    const mys = mrows.flatMap((r) => [r.maint, r.target, r.ate].filter(isNum));
+    const my0 = mys.length ? Math.floor((Math.min(...mys) - 100) / 100) * 100 : 0;
+    const my1 = mys.length ? Math.ceil((Math.max(...mys) + 100) / 100) * 100 : 1;
+    const mx0 = mrows.length ? mrows[0].x : 0, mx1 = mrows.length ? mrows[mrows.length - 1].x : 1;
+    const mticks = [0, 1, 2, 3].map((i) => Math.round(mx0 + ((mx1 - mx0) * i) / 3));
     const weeks = weekRows(data, der, today);
     return (React.createElement(React.Fragment, null,
         React.createElement("section", { className: "sec" },
@@ -671,7 +1027,7 @@ function TrendTab({ data, der, today, pal }) {
                         s.goalLow))),
             paceRate != null && paceRate > 0.05 && (React.createElement(React.Fragment, null,
                 React.createElement("h3", null,
-                    "At your current pace (",
+                    "At your two-week pace (",
                     fmt1(paceRate),
                     " lb/week)"),
                 React.createElement("div", { className: "eta" },
@@ -684,19 +1040,37 @@ function TrendTab({ data, der, today, pal }) {
                         React.createElement("div", { className: "eta-v" }, paceLow ? fmtDayYear(paceLow) : "–"),
                         React.createElement("div", { className: "eta-l" },
                             "reach ",
-                            s.goalLow))),
-                paceRate > s.maxRate && React.createElement("p", { className: "note", style: { marginTop: 8 } },
-                    "Current pace is above your ",
-                    s.maxRate,
-                    " lb/week cap, so the plan line is the realistic one."))),
+                            s.goalLow))))),
             maintAtGoal != null && (React.createElement("p", { className: "note", style: { marginTop: 14 } },
                 "Estimated maintenance once you're around ",
                 fmt1(mid),
                 " lb: roughly ",
                 fmtInt(round50(maintAtGoal)),
-                " kcal. Your current estimate is ",
-                fmtInt(round50(est.tdee)),
-                "."))),
+                " kcal, versus ",
+                fmtInt(round50(nowRow.est)),
+                " now."))),
+        mrows.length > 1 && (React.createElement("section", { className: "sec" },
+            React.createElement("h2", null, "Maintenance estimate"),
+            React.createElement("div", { style: { width: "100%", height: 230 } },
+                React.createElement(ResponsiveContainer, null,
+                    React.createElement(LineChart, { data: mrows, margin: { top: 8, right: 10, bottom: 0, left: -6 } },
+                        React.createElement(CartesianGrid, { stroke: pal.line, strokeDasharray: "2 4", vertical: false }),
+                        React.createElement(XAxis, { type: "number", dataKey: "x", domain: [mx0, mx1], ticks: mticks, tickFormatter: fmtDayN, tick: { fill: pal.muted, fontSize: 12 }, axisLine: { stroke: pal.line }, tickLine: false }),
+                        React.createElement(YAxis, { domain: [my0, my1], tickFormatter: (v) => fmtInt(v), width: 52, tick: { fill: pal.muted, fontSize: 12 }, axisLine: false, tickLine: false }),
+                        React.createElement(Tooltip, { content: React.createElement(ChartTip, null) }),
+                        React.createElement(Line, { dataKey: "maint", stroke: pal.accent, strokeWidth: 2.75, dot: false, isAnimationActive: false }),
+                        React.createElement(Line, { dataKey: "target", type: "stepAfter", stroke: pal.amber, strokeWidth: 2, dot: false, isAnimationActive: false }),
+                        React.createElement(Line, { dataKey: "ate", stroke: "none", strokeWidth: 0, dot: { r: 2.5, fill: pal.ink, stroke: "none" }, isAnimationActive: false })))),
+            React.createElement("div", { className: "legend" },
+                React.createElement("span", null,
+                    React.createElement("span", { className: "sw", style: { borderColor: pal.accent } }),
+                    "Maintenance estimate"),
+                React.createElement("span", null,
+                    React.createElement("span", { className: "sw", style: { borderColor: pal.amber } }),
+                    "Target"),
+                React.createElement("span", null,
+                    React.createElement("span", { className: "sw dot", style: { background: pal.ink } }),
+                    "What you ate")))),
         React.createElement("section", { className: "sec" },
             React.createElement("h2", null, "Weeks"),
             React.createElement("table", { className: "tbl" },
@@ -708,7 +1082,7 @@ function TrendTab({ data, der, today, pal }) {
                         React.createElement("th", { className: "r" }, "Avg change"))),
                 React.createElement("tbody", null, weeks.map((r) => (React.createElement("tr", { key: r.ws },
                     React.createElement("td", null, fmtDay(r.ws)),
-                    React.createElement("td", { className: "r" }, r.target != null ? fmtInt(r.target) : React.createElement("span", { className: "dim" }, "\u2013")),
+                    React.createElement("td", { className: "r" }, r.target != null ? fmtInt(round50(r.target)) : React.createElement("span", { className: "dim" }, "\u2013")),
                     React.createElement("td", { className: "r" }, r.avg != null ? React.createElement(React.Fragment, null,
                         fmtInt(r.avg),
                         " ",
@@ -717,120 +1091,125 @@ function TrendTab({ data, der, today, pal }) {
                             r.n,
                             "d)")) : React.createElement("span", { className: "dim" }, "\u2013")),
                     React.createElement("td", { className: "r" }, r.change != null ? `${r.change <= 0 ? "−" : "+"}${fmt1(Math.abs(r.change))}` : React.createElement("span", { className: "dim" }, "\u2013"))))))),
-            React.createElement("p", { className: "note", style: { marginTop: 8 } }, "Avg change is the shift in your 7-day average across the week."))));
+            React.createElement("p", { className: "note", style: { marginTop: 8 } }, "Target is what the app told you that week. Avg change is the shift in your 7-day average across the week."))));
 }
 function WatchTab({ data, der, pal }) {
     const s = data.settings;
-    const { last } = der;
+    const r = der.row;
     const head = React.createElement("h2", null, "Apple Watch accuracy");
-    if (!last)
-        return React.createElement("section", { className: "sec" },
-            head,
-            React.createElement("p", null, "Log weigh-ins and watch totals to start the comparison."));
-    const end = last.k;
-    const days = [];
-    for (let k = addDays(end, -28); k < end; k = addDays(k, 1)) {
-        const e = data.entries[k];
-        if (e && isNum(e.watch))
-            days.push({ k, watch: e.watch });
-    }
-    if (!days.length) {
+    const w = r ? r.watch : null;
+    if (!w || !w.nCal) {
         return (React.createElement("section", { className: "sec" },
             head,
-            React.createElement("p", null, "No watch totals yet. Add yesterday's total (active plus resting) in your morning check-in."),
-            React.createElement("p", { className: "note" }, "After about two weeks, this compares the watch's average against the burn your scale and food log imply. Three to four weeks gives a solid read.")));
+            React.createElement("p", null, "No watch numbers yet. Add yesterday's active energy (and resting, if you have it) in your morning check-in."),
+            React.createElement("p", { className: "note" },
+                "Watch numbers only count after the two-week water washout. Calibration needs ",
+                MODEL.calibMinWatch,
+                " logged days in a ",
+                MODEL.calibDays,
+                "-day window.")));
     }
-    const start = days[0].k;
-    const n = days.length;
-    const ws = windowStats(data.entries, start, end);
-    const cur = der.est ? der.est.cur : last.w;
-    const overnight = (mifflin(cur, s) / 24) * s.sleepHours;
-    const raw = mean(days.map((d) => d.watch));
-    const adj = raw + overnight;
-    const scale = n >= 7 ? ws.scaleBurn : null;
-    const early = dayNum(start) - dayNum(s.cutStart) < 21;
-    const pct = scale ? (adj / scale - 1) * 100 : null;
-    const factor = scale ? scale / adj : null;
-    const ref = scale ?? der.est?.tdee ?? null;
-    const bars = days.map((d) => ({ label: fmtDay(d.k), adj: d.watch + overnight }));
-    const yMin = Math.floor((Math.min(...bars.map((b) => b.adj), ref ?? Infinity) * 0.85) / 100) * 100;
+    const pct = isNum(w.ratio) ? (w.ratio - 1) * 100 : null;
+    const pctSig = isNum(w.ratioSigma) ? w.ratioSigma * 100 : null;
+    const bars = [];
+    const ints = [];
+    for (let d = w.from; d < r.k; d = addDays(d, 1)) {
+        const e = data.entries[d];
+        if (e && isNum(e.intake))
+            ints.push(e.intake);
+    }
+    const fb = ints.length ? mean(ints) : null;
+    for (let d = w.from; d < r.k; d = addDays(d, 1)) {
+        const b = watchBurn(data.entries, d, s, fb);
+        if (b)
+            bars.push({ label: fmtDay(d), burn: b.burn });
+    }
+    const ref = w.meas ? w.meas.obs : null;
+    const yMin = Math.floor((Math.min(...bars.map((b) => b.burn), ref ?? Infinity) * 0.85) / 100) * 100;
     return (React.createElement(React.Fragment, null,
         React.createElement("section", { className: "sec" },
             head,
             React.createElement("div", { className: "eta" },
                 React.createElement("div", null,
-                    React.createElement("div", { className: "eta-v" }, fmtInt(raw)),
+                    React.createElement("div", { className: "eta-v" }, fmtInt(w.meanBurn)),
                     React.createElement("div", { className: "eta-l" },
-                        "watch average, ",
-                        n,
+                        "watch burn, ",
+                        w.nCal,
                         " day",
-                        n === 1 ? "" : "s")),
+                        w.nCal === 1 ? "" : "s",
+                        " since ",
+                        fmtDay(w.from))),
                 React.createElement("div", null,
-                    React.createElement("div", { className: "eta-v" }, fmtInt(adj)),
-                    React.createElement("div", { className: "eta-l" },
-                        "plus ~",
-                        fmtInt(overnight),
-                        " overnight")),
-                React.createElement("div", null,
-                    React.createElement("div", { className: "eta-v" }, scale ? fmtInt(scale) : "–"),
-                    React.createElement("div", { className: "eta-l" }, "burn your scale implies")),
+                    React.createElement("div", { className: "eta-v" }, w.meas ? `${fmtInt(w.meas.obs)} ± ${fmtInt(w.meas.sigma)}` : "–"),
+                    React.createElement("div", { className: "eta-l" }, "scale, same days")),
                 React.createElement("div", null,
                     React.createElement("div", { className: "eta-v" }, pct != null ? `${pct >= 0 ? "+" : "−"}${fmt1(Math.abs(pct))}%` : "–"),
-                    React.createElement("div", { className: "eta-l" }, "watch vs scale"))),
-            scale == null && React.createElement("p", { className: "note", style: { marginTop: 12 } },
-                "Needs at least 7 days of watch totals for a first comparison. You have ",
-                n,
-                "."),
-            scale != null && (React.createElement("p", { style: { marginTop: 12 } },
-                Math.abs(pct) < 5
-                    ? "So far the watch is tracking your real burn closely."
-                    : pct > 0 ? `So far the watch reads about ${fmt1(pct)}% high.` : `So far the watch reads about ${fmt1(-pct)}% low.`,
-                " ",
-                "To convert a watch total into an estimate of your real burn, add ",
-                fmtInt(overnight),
-                " and multiply by ",
-                factor.toFixed(2),
-                ".")),
-            scale != null && n < 21 && React.createElement("p", { className: "note" }, "Early read. Day-to-day scale noise moves this a lot until you have three or more weeks of watch data."),
-            scale != null && early && React.createElement("p", { className: "note" }, "Some of these days fall in the first three weeks of the cut, when water loss inflates the scale's number. Expect the watch to look a bit lower than it really is until those days roll out.")),
+                    React.createElement("div", { className: "eta-l" },
+                        "watch vs scale",
+                        pctSig != null ? `, ± ${fmt1(pctSig)}%` : "")),
+                React.createElement("div", null,
+                    React.createElement("div", { className: "eta-v" }, w.calibrated ? `× ${w.c.toFixed(2)}` : `${w.nCal}/${MODEL.calibMinWatch}`),
+                    React.createElement("div", { className: "eta-l" }, w.calibrated ? "calibration factor" : "days toward calibration"))),
+            React.createElement("p", { style: { marginTop: 12 } }, !w.meas
+                ? "Needs about a week of watch data, weigh-ins and calories before the first comparison."
+                : pctSig != null && Math.abs(pct) <= pctSig
+                    ? "So far the watch and the scale agree within the error bar, so there's no verdict yet."
+                    : pct > 0 ? `So far the watch reads about ${fmt1(pct)}% high.` : `So far the watch reads about ${fmt1(-pct)}% low.`),
+            w.calibrated && w.active && (React.createElement("p", null,
+                "This week's activity is ",
+                Math.round(Math.abs(w.change) * 100),
+                "% ",
+                w.change >= 0 ? "above" : "below",
+                " your three-week normal, which moves maintenance ",
+                fmtSigned(r.shift),
+                w.flag ? ". That's a big enough change to check: did something in your routine change?" : ".")),
+            w.calibrated && !w.active && React.createElement("p", { className: "note" }, "Calibrated. The watch votes once 5 of the last 7 days have numbers."),
+            React.createElement("p", { className: "note", style: { marginTop: 10 } },
+                "Watch burn is active plus resting plus the overnight hours the watch is off (",
+                s.sleepHours,
+                " h at your formula BMR), plus 10% of what you ate, since the watch doesn't see digestion.",
+                w.formulaRestDays > 0 ? ` On ${w.formulaRestDays} of these days there was no resting number, so the formula BMR stood in for the whole day.` : "")),
         React.createElement("section", { className: "sec" },
-            React.createElement("h2", null, "Daily watch totals"),
+            React.createElement("h2", null, "Daily watch burn"),
             React.createElement("div", { style: { width: "100%", height: 220 } },
                 React.createElement(ResponsiveContainer, null,
                     React.createElement(BarChart, { data: bars, margin: { top: 8, right: 10, bottom: 0, left: -10 } },
                         React.createElement(CartesianGrid, { stroke: pal.line, strokeDasharray: "2 4", vertical: false }),
                         React.createElement(XAxis, { dataKey: "label", tick: { fill: pal.muted, fontSize: 11 }, axisLine: { stroke: pal.line }, tickLine: false, interval: "preserveStartEnd", minTickGap: 18 }),
                         React.createElement(YAxis, { domain: [yMin, "auto"], tickFormatter: (v) => fmtInt(v), width: 52, tick: { fill: pal.muted, fontSize: 12 }, axisLine: false, tickLine: false }),
-                        React.createElement(Tooltip, { cursor: { fill: pal.line, fillOpacity: 0.3 }, contentStyle: { background: pal.surface, border: `1px solid ${pal.line}`, borderRadius: 10, color: pal.ink, fontSize: 13 }, formatter: (v) => [fmtInt(v), "Watch + overnight"] }),
-                        React.createElement(Bar, { dataKey: "adj", fill: pal.accent, fillOpacity: 0.75, radius: [4, 4, 0, 0], isAnimationActive: false }),
+                        React.createElement(Tooltip, { cursor: { fill: pal.line, fillOpacity: 0.3 }, contentStyle: { background: pal.surface, border: `1px solid ${pal.line}`, borderRadius: 10, color: pal.ink, fontSize: 13 }, formatter: (v) => [fmtInt(v), "Watch burn"] }),
+                        React.createElement(Bar, { dataKey: "burn", fill: pal.accent, fillOpacity: 0.75, radius: [4, 4, 0, 0], isAnimationActive: false }),
                         ref != null && React.createElement(ReferenceLine, { y: ref, stroke: pal.amber, strokeWidth: 2, strokeDasharray: "6 4" })))),
-            React.createElement("p", { className: "note" },
-                "Bars include the estimated overnight burn. The dashed line is ",
-                scale ? "the burn your scale implies over the same days" : "your current maintenance estimate",
-                "."))));
+            React.createElement("p", { className: "note" }, "The dashed line is the burn your scale and food log imply over the same days."))));
 }
+const EDIT_FIELDS = [
+    { key: "weight", label: "Weight", dec: true, min: 80, max: 500 },
+    { key: "intake", label: "Ate", min: 0, max: 12000 },
+    { key: "protein", label: "Protein", min: 0, max: 600 },
+    { key: "active", label: "Active", min: 0, max: 8000 },
+    { key: "resting", label: "Resting", min: 0, max: 5000 },
+    { key: "water", label: "Bottles", dec: true, min: 0, max: 40 },
+];
 function HistRow({ k, e, onSave }) {
     const [edit, setEdit] = useState(false);
-    const [w, setW] = useState(""), [c, setC] = useState(""), [x, setX] = useState("");
+    const [v, setV] = useState({});
     const [err, setErr] = useState(null);
     const begin = () => {
-        setW(isNum(e.weight) ? String(e.weight) : "");
-        setC(isNum(e.intake) ? String(e.intake) : "");
-        setX(isNum(e.watch) ? String(e.watch) : "");
+        const o = {};
+        EDIT_FIELDS.forEach((f) => { o[f.key] = isNum(e[f.key]) ? String(e[f.key]) : ""; });
+        setV(o);
         setErr(null);
         setEdit(true);
     };
     const save = () => {
-        const wv = parseNum(w), cv = parseNum(c), xv = parseNum(x);
-        if ([wv, cv, xv].some((v) => Number.isNaN(v)))
-            return setErr("Use plain numbers, or leave a field blank to clear it.");
         const next = {};
-        if (wv != null)
-            next.weight = wv;
-        if (cv != null)
-            next.intake = Math.round(cv);
-        if (xv != null)
-            next.watch = Math.round(xv);
+        for (const f of EDIT_FIELDS) {
+            const c = cleanVal(v[f.key], f);
+            if (c.err)
+                return setErr(`${f.label} doesn't look right. Use a plain number, or leave it blank to clear it.`);
+            if (c.v != null)
+                next[f.key] = c.v;
+        }
         onSave(k, next);
         setEdit(false);
     };
@@ -839,21 +1218,14 @@ function HistRow({ k, e, onSave }) {
             React.createElement("span", null, fmtDayLong(k)),
             React.createElement("span", null, isNum(e.weight) ? fmt1(e.weight) : React.createElement("span", { className: "dim" }, "\u2013")),
             React.createElement("span", null, isNum(e.intake) ? fmtInt(e.intake) : React.createElement("span", { className: "dim" }, "\u2013")),
-            React.createElement("span", null, isNum(e.watch) ? fmtInt(e.watch) : React.createElement("span", { className: "dim" }, "\u2013")),
+            React.createElement("span", null, isNum(e.active) ? fmtInt(e.active) : React.createElement("span", { className: "dim" }, "\u2013")),
             React.createElement("button", { className: "link", style: { marginTop: 0 }, onClick: begin, "aria-label": `Edit ${fmtDay(k)}` }, "Edit")));
     }
     return (React.createElement("div", { className: "hist-edit" },
         React.createElement("p", { style: { fontWeight: 600, marginBottom: 8 } }, fmtDayLong(k)),
-        React.createElement("div", { className: "row2", style: { gridTemplateColumns: "1fr 1fr 1fr" } },
-            React.createElement("label", { className: "field" },
-                React.createElement("span", null, "Weight"),
-                React.createElement("input", { className: "input sm", inputMode: "decimal", value: w, onChange: (ev) => setW(ev.target.value) })),
-            React.createElement("label", { className: "field" },
-                React.createElement("span", null, "Ate"),
-                React.createElement("input", { className: "input sm", inputMode: "numeric", value: c, onChange: (ev) => setC(ev.target.value) })),
-            React.createElement("label", { className: "field" },
-                React.createElement("span", null, "Watch"),
-                React.createElement("input", { className: "input sm", inputMode: "numeric", value: x, onChange: (ev) => setX(ev.target.value) }))),
+        React.createElement("div", { className: "row2", style: { gridTemplateColumns: "1fr 1fr 1fr" } }, EDIT_FIELDS.map((f) => (React.createElement("label", { className: "field", key: f.key },
+            React.createElement("span", null, f.label),
+            React.createElement("input", { className: "input sm", inputMode: f.dec ? "decimal" : "numeric", value: v[f.key] || "", onChange: (ev) => setV({ ...v, [f.key]: ev.target.value }) }))))),
         React.createElement("div", { className: "btns", style: { marginTop: 0 } },
             React.createElement("button", { className: "btn sm", onClick: save }, "Save day"),
             React.createElement("button", { className: "btn ghost sm", onClick: () => setEdit(false) }, "Cancel"),
@@ -873,30 +1245,45 @@ const SETTING_FIELDS = [
     { key: "age", label: "Age" },
     { key: "activity", label: "Activity multiplier" },
     { key: "sleepHours", label: "Hours watch is off overnight" },
+    { key: "bottleOz", label: "Water bottle size (oz)" },
 ];
 function Settings({ data, onSave }) {
-    const [f, setF] = useState(() => Object.fromEntries(Object.entries(data.settings).map(([k, v]) => [k, String(v)])));
+    const toStrings = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, String(v)]));
+    const [f, setF] = useState(() => toStrings(data.settings));
     const [msg, setMsg] = useState(null);
     const save = () => {
         const next = { ...data.settings };
         for (const { key, label } of SETTING_FIELDS) {
             const v = parseNum(f[key]);
-            if (v == null || Number.isNaN(v) || v < 0)
+            if (v == null || Number.isNaN(v) || v <= 0)
                 return setMsg({ err: true, t: `${label} needs a number.` });
             next[key] = v;
         }
         next.sex = f.sex === "female" ? "female" : "male";
-        if (/^\d{4}-\d{2}-\d{2}$/.test(f.cutStart))
+        next.targetMode = f.targetMode === "weekly" ? "weekly" : "daily";
+        if (isKey(f.cutStart))
             next.cutStart = f.cutStart;
+        next.shortcutName = (f.shortcutName || "").trim() || "Cut check-in";
         if (next.goalRate > next.maxRate)
             next.goalRate = next.maxRate;
         if (next.goalLow > next.goalHigh)
             [next.goalLow, next.goalHigh] = [next.goalHigh, next.goalLow];
         onSave(next);
-        setF(Object.fromEntries(Object.entries(next).map(([k, v]) => [k, String(v)])));
-        setMsg({ err: false, t: "Settings saved. They apply when next week's target is set, or right away if you recalculate this week." });
+        setF(toStrings(next));
+        setMsg({ err: false, t: "Settings saved. Today's number is recalculated with them." });
     };
     return (React.createElement("div", { className: "panel" },
+        React.createElement("label", { className: "field" },
+            React.createElement("span", null, "Target changes"),
+            React.createElement("select", { className: "input sm", value: f.targetMode, onChange: (e) => setF({ ...f, targetMode: e.target.value }) },
+                React.createElement("option", { value: "daily" },
+                    "Every morning, at most ",
+                    MODEL.dailyCap,
+                    " at a time"),
+                React.createElement("option", { value: "weekly" },
+                    "Once a week on Saturday, at most ",
+                    MODEL.weeklyCap,
+                    " at a time"))),
         React.createElement("div", { className: "row2" },
             SETTING_FIELDS.map(({ key, label }) => (React.createElement("label", { className: "field", key: key },
                 React.createElement("span", null, label),
@@ -908,15 +1295,27 @@ function Settings({ data, onSave }) {
                     React.createElement("option", { value: "female" }, "Female"))),
             React.createElement("label", { className: "field" },
                 React.createElement("span", null, "Cut start date"),
-                React.createElement("input", { className: "input sm", type: "date", value: f.cutStart, onChange: (e) => setF({ ...f, cutStart: e.target.value }) }))),
-        React.createElement("p", { className: "note", style: { marginBottom: 12 } }, "An activity multiplier of 1.675 reproduces the 3,300 kcal Mifflin\u2013St Jeor estimate at 211 lb."),
+                React.createElement("input", { className: "input sm", type: "date", value: f.cutStart, onChange: (e) => setF({ ...f, cutStart: e.target.value }) })),
+            React.createElement("label", { className: "field" },
+                React.createElement("span", null, "Health Shortcut name"),
+                React.createElement("input", { className: "input sm", value: f.shortcutName ?? "", onChange: (e) => setF({ ...f, shortcutName: e.target.value }) }))),
+        React.createElement("p", { className: "note", style: { marginBottom: 12 } }, "The app replays every day from your cut start, so changing these recalculates the estimate from the beginning. What it told you on past days stays in the history."),
         React.createElement("button", { className: "btn", onClick: save }, "Save settings"),
         msg && React.createElement("p", { className: msg.err ? "err" : "ok", role: "status" }, msg.t)));
 }
-function Backup({ data, onImport }) {
+function ExportPanel({ data, der, onImport }) {
     const [out, setOut] = useState(null);
     const [inp, setInp] = useState("");
     const [msg, setMsg] = useState(null);
+    const report = (res, what) => {
+        if (res === "shared")
+            setMsg({ err: false, t: `${what} shared.` });
+        else if (res === "downloaded")
+            setMsg({ err: false, t: `${what} downloaded.` });
+        else if (res === "failed")
+            setMsg({ err: true, t: "Couldn't export here. Use Show as text and copy it instead." });
+    };
+    const stamp = todayKey();
     const copy = async () => {
         try {
             await navigator.clipboard.writeText(out);
@@ -926,20 +1325,9 @@ function Backup({ data, onImport }) {
             setMsg({ err: true, t: "Copy blocked here. Select the text and copy it manually." });
         }
     };
-    const download = () => {
-        const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `cut-tracker-backup-${todayKey()}.json`;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 3000);
-    };
     const importText = (t) => {
         try {
-            const d = normalize(JSON.parse(t));
+            const d = migrate(JSON.parse(t), todayKey());
             if (!d)
                 throw new Error("bad");
             onImport(d);
@@ -951,20 +1339,21 @@ function Backup({ data, onImport }) {
         }
     };
     return (React.createElement("div", { className: "panel" },
-        React.createElement("p", { className: "note", style: { marginBottom: 10 } }, "Your data lives only on this phone. Download a backup now and then and drop it in Obsidian."),
+        React.createElement("p", { className: "note", style: { marginBottom: 10 } }, "Your data lives only on this phone. Export now and then. The share sheet lets you save to Files, AirDrop it, or send it to Obsidian."),
         React.createElement("div", { className: "btns", style: { marginTop: 0 } },
-            React.createElement("button", { className: "btn ghost sm", onClick: download }, "Download backup"),
+            React.createElement("button", { className: "btn sm", onClick: async () => report(await shareFile(`cut-tracker-backup-${stamp}.json`, JSON.stringify(data), "application/json"), "Backup") }, "Export backup"),
+            React.createElement("button", { className: "btn ghost sm", onClick: async () => report(await shareFile(`cut-tracker-${stamp}.csv`, toCSV(data, der), "text/csv"), "CSV") }, "Export CSV"),
             React.createElement("button", { className: "btn ghost sm", onClick: () => { setOut(JSON.stringify(data)); setMsg(null); } }, "Show as text"),
-            out && React.createElement("button", { className: "btn sm", onClick: copy }, "Copy")),
+            out && React.createElement("button", { className: "btn ghost sm", onClick: copy }, "Copy")),
         out && React.createElement("textarea", { className: "input", readOnly: true, value: out, style: { marginTop: 10 }, onFocus: (e) => e.target.select() }),
         React.createElement("h3", null, "Restore"),
-        React.createElement("p", { className: "note", style: { marginBottom: 8 } }, "Restoring replaces everything currently in the app."),
-        React.createElement("label", { className: "btn sm filebtn" },
+        React.createElement("p", { className: "note", style: { marginBottom: 8 } }, "Restoring replaces everything currently in the app. Backups from earlier versions work too."),
+        React.createElement("label", { className: "btn ghost sm filebtn" },
             "Choose backup file",
             React.createElement("input", { type: "file", accept: ".json,application/json,text/plain", onChange: async (e) => {
-                    const f = e.target.files && e.target.files[0];
-                    if (f)
-                        importText(await f.text());
+                    const fl = e.target.files && e.target.files[0];
+                    if (fl)
+                        importText(await fl.text());
                     e.target.value = "";
                 } })),
         React.createElement("label", { className: "field", style: { marginTop: 14 } },
@@ -973,38 +1362,48 @@ function Backup({ data, onImport }) {
         React.createElement("button", { className: "btn ghost sm", onClick: () => importText(inp), disabled: !inp.trim() }, "Restore from pasted text"),
         msg && React.createElement("p", { className: msg.err ? "err" : "ok", role: "status" }, msg.t)));
 }
-function HistoryTab({ data, onSaveEntry, onSaveSettings, onImport }) {
+function HistoryTab({ data, der, onSaveEntry, onSaveSettings, onImport }) {
     const keys = Object.keys(data.entries).sort().reverse();
     return (React.createElement(React.Fragment, null,
         React.createElement("section", { className: "sec" },
+            React.createElement("h2", null, "Export and backup"),
+            React.createElement(ExportPanel, { data: data, der: der, onImport: onImport })),
+        React.createElement("section", { className: "sec" },
             React.createElement("h2", null, "Daily log"),
-            React.createElement("p", { className: "note", style: { marginBottom: 6 } }, "Weight is that morning. Calories and watch are for that whole day, entered the next morning."),
+            React.createElement("p", { className: "note", style: { marginBottom: 6 } }, "Weight is that morning. Everything else is for that whole day, entered the next morning. Tap Edit to see protein, resting and water."),
             React.createElement("div", { className: "hist-row hist-head" },
                 React.createElement("span", null, "Day"),
                 React.createElement("span", null, "Weight"),
                 React.createElement("span", null, "Ate"),
-                React.createElement("span", null, "Watch"),
+                React.createElement("span", null, "Active"),
                 React.createElement("span", null)),
             keys.map((k) => React.createElement(HistRow, { key: k, k: k, e: data.entries[k], onSave: onSaveEntry }))),
         React.createElement("section", { className: "sec" },
             React.createElement("h2", null, "Settings"),
-            React.createElement(Settings, { data: data, onSave: onSaveSettings })),
-        React.createElement("section", { className: "sec" },
-            React.createElement("h2", null, "Backup"),
-            React.createElement(Backup, { data: data, onImport: onImport }))));
+            React.createElement(Settings, { data: data, onSave: onSaveSettings }))));
 }
 /* ---------- app ---------- */
 function readPrefill() {
     try {
         const p = new URLSearchParams(window.location.search);
         const o = {};
-        ["w", "cal", "watch", "date"].forEach((k) => { const v = p.get(k); if (v)
+        ["w", "cal", "protein", "active", "resting", "water", "date", "save"].forEach((k) => { const v = p.get(k); if (v)
             o[k] = v; });
         return Object.keys(o).length ? o : null;
     }
     catch {
         return null;
     }
+}
+// Remember what the app told you each day, so history shows the real advice even if settings change later.
+function withGiven(d, day) {
+    const der = derive(d, day);
+    const r = der.byKey[day];
+    if (!r || !isNum(r.target) || !(d.entries[day] && isNum(d.entries[day].weight)))
+        return d;
+    if (d.given[day] === r.target)
+        return d;
+    return { ...d, given: { ...d.given, [day]: r.target } };
 }
 function App() {
     const today = todayKey();
@@ -1023,7 +1422,7 @@ function App() {
             setStoreErr(null);
         }
         catch (e) {
-            setStoreErr("Couldn't save to this phone's storage, so recent changes may be lost. Download a backup from History.");
+            setStoreErr("Couldn't save to this phone's storage, so recent changes may be lost. Export a backup from History.");
         }
     };
     useEffect(() => {
@@ -1039,20 +1438,22 @@ function App() {
         catch { /* ignore */ }
         let alive = true;
         (async () => {
-            let d = null;
+            let raw = null;
             try {
                 const r = await storage.get(KEY);
                 if (r && r.value)
-                    d = normalize(JSON.parse(r.value));
+                    raw = JSON.parse(r.value);
             }
             catch (e) { /* nothing stored yet */ }
+            let d = raw ? migrate(raw, today) : null;
             const fresh = !d;
             if (!d)
                 d = emptyData();
-            const checked = ensureWeek(d, today);
+            const upgraded = !!raw && (raw.version || 1) < VERSION;
+            const checked = withGiven(d, today);
             if (!alive)
                 return;
-            if (fresh || checked !== d)
+            if (fresh || upgraded || checked !== d)
                 persist(checked);
             else
                 setData(d);
@@ -1061,20 +1462,18 @@ function App() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
     const der = useMemo(() => (data ? derive(data, today) : null), [data, today]);
-    const saveCheckIn = (date, w, cal, watch) => {
+    const saveCheckIn = (date, vals) => {
         const entries = { ...data.entries };
         const pk = addDays(date, -1);
-        if (w != null)
-            entries[date] = { ...(entries[date] || {}), weight: w };
-        if (cal != null || watch != null) {
-            const p = { ...(entries[pk] || {}) };
-            if (cal != null)
-                p.intake = cal;
-            if (watch != null)
-                p.watch = watch;
-            entries[pk] = p;
-        }
-        persist(ensureWeek({ ...data, entries }, today));
+        if (isNum(vals.weight))
+            entries[date] = { ...(entries[date] || {}), weight: vals.weight };
+        const prevFields = {};
+        for (const f of ["intake", "protein", "active", "resting", "water"])
+            if (isNum(vals[f]))
+                prevFields[f] = vals[f];
+        if (Object.keys(prevFields).length)
+            entries[pk] = { ...(entries[pk] || {}), ...prevFields };
+        persist(withGiven({ ...data, entries }, date));
     };
     const saveEntry = (k, entry) => {
         const entries = { ...data.entries };
@@ -1082,11 +1481,7 @@ function App() {
             entries[k] = entry;
         else
             delete entries[k];
-        persist(ensureWeek({ ...data, entries }, today));
-    };
-    const recalc = () => {
-        const ws = weekStart(today);
-        persist(lockWeek(data, ws, latestWeightKey(data.entries, today)));
+        persist({ ...data, entries });
     };
     const shell = (children) => (React.createElement("div", { className: "ct" },
         React.createElement("style", null, CSS),
@@ -1095,8 +1490,8 @@ function App() {
     if (!data || !der)
         return shell(React.createElement("p", { className: "note", style: { paddingTop: 24 } }, "Loading your log\u2026"));
     const s = data.settings;
-    const rate = der.est?.rateWk;
-    const toGo = der.est ? der.est.cur - s.goalHigh : der.last ? der.last.w - s.goalHigh : null;
+    const rate = der.t14 ? der.t14.rateWk : null;
+    const toGo = der.t14 ? der.t14.now - s.goalHigh : der.last ? der.last.w - s.goalHigh : null;
     return shell(React.createElement(React.Fragment, null,
         React.createElement("div", { className: "brand" }, "Cut tracker"),
         React.createElement("div", { className: "readout" },
@@ -1106,10 +1501,10 @@ function App() {
             React.createElement(Stat, { v: toGo != null ? fmt1(Math.max(0, toGo)) : "–", l: `lb to ${s.goalHigh}` })),
         React.createElement("nav", { className: "tabs", role: "tablist", "aria-label": "Sections" }, [["today", "Today"], ["trend", "Trend"], ["watch", "Watch"], ["history", "History"]].map(([id, label]) => (React.createElement("button", { key: id, role: "tab", className: "tab", "aria-selected": tab === id, onClick: () => setTab(id) }, label)))),
         storeErr && React.createElement("p", { className: "err" }, storeErr),
-        tab === "today" && (React.createElement(TodayTab, { data: data, der: der, today: today, onSave: saveCheckIn, onRecalc: recalc, prefill: prefill, onPrefillUsed: () => setPrefill(null), onRestore: () => setTab("history") })),
+        tab === "today" && (React.createElement(TodayTab, { data: data, der: der, today: today, onSave: saveCheckIn, prefill: prefill, onPrefillUsed: () => setPrefill(null), onRestore: () => setTab("history") })),
         tab === "trend" && React.createElement(TrendTab, { data: data, der: der, today: today, pal: pal }),
         tab === "watch" && React.createElement(WatchTab, { data: data, der: der, pal: pal }),
-        tab === "history" && (React.createElement(HistoryTab, { data: data, onSaveEntry: saveEntry, onSaveSettings: (settings) => persist({ ...data, settings }), onImport: (d) => { persist(ensureWeek(d, today)); } }))));
+        tab === "history" && (React.createElement(HistoryTab, { data: data, der: der, onSaveEntry: saveEntry, onSaveSettings: (settings) => persist({ ...data, settings }), onImport: (d) => persist(withGiven(d, today)) }))));
 }
 createRoot(document.getElementById("root")).render(React.createElement(App, null));
 window.__cutTrackerLoaded = true;
